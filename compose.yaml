@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    image: ai-video:local
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:${APP_PORT:-8080}:8080"
+    environment:
+      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
+      MINIMAX_BASE_URL: "${MINIMAX_BASE_URL:-https://api.minimax.io}"
+      ALLOW_PAID_GENERATION: "${ALLOW_PAID_GENERATION:-false}"
+      WORKER_COUNT: "${WORKER_COUNT:-2}"
+      POLL_INTERVAL: "${POLL_INTERVAL:-10s}"
+      MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-262144000}"
+      MAX_DOWNLOAD_BYTES: "${MAX_DOWNLOAD_BYTES:-2147483648}"
+    volumes:
+      - ai-video-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  ai-video-data:

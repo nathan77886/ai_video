@@ -1,0 +1,6 @@
+.git
+data
+frontend/node_modules
+frontend/dist
+coverage.out
+*.log
