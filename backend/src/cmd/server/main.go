@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -26,7 +27,12 @@ func main() {
 
 	paidAllowed := envBool("ALLOW_PAID_GENERATION", false)
 	miniMaxKey := strings.TrimSpace(os.Getenv("MINIMAX_API_KEY"))
-	miniMax, err := app.NewMiniMaxProvider(env("MINIMAX_BASE_URL", "https://api.minimax.io"), miniMaxKey, paidAllowed)
+	openAIKey, err := envSecret("OPENAI_API_KEY", "OPENAI_API_KEY_FILE")
+	if err != nil {
+		logger.Error("configure OpenAI image key", "error", err)
+		os.Exit(1)
+	}
+	miniMax, err := app.NewMiniMaxProvider(env("MINIMAX_BASE_URL", "https://api.minimaxi.com"), miniMaxKey, paidAllowed)
 	if err != nil {
 		logger.Error("configure MiniMax", "error", err)
 		os.Exit(1)
@@ -43,6 +49,17 @@ func main() {
 		envInt64("MAX_DOWNLOAD_BYTES", 2<<30),
 		logger,
 	)
+	openAIImage, err := app.NewOpenAIImageProvider(
+		env("OPENAI_IMAGE_BASE_URL", "http://host.docker.internal:8317/v1"),
+		openAIKey,
+	)
+	if err != nil {
+		logger.Error("configure OpenAI image", "error", err)
+		os.Exit(1)
+	}
+	if openAIKey != "" {
+		worker.SetImageProvider("openai", openAIImage)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -58,6 +75,7 @@ func main() {
 		envInt64("MAX_UPLOAD_BYTES", 250<<20),
 		paidAllowed,
 		miniMaxKey != "",
+		openAIKey != "",
 	)
 	server := &http.Server{
 		Addr:              env("LISTEN_ADDR", "127.0.0.1:8780"),
@@ -131,4 +149,19 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return value
+}
+
+func envSecret(name, fileName string) (string, error) {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value, nil
+	}
+	path := strings.TrimSpace(os.Getenv(fileName))
+	if path == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", fileName, err)
+	}
+	return strings.TrimSpace(string(data)), nil
 }

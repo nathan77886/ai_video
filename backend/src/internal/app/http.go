@@ -8,16 +8,21 @@ import (
 	"log/slog"
 	"mime/multipart"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const maxJSONBody = 2 << 20
+const (
+	maxJSONBody         = 2 << 20
+	maxTextPreviewBytes = 1 << 20
+)
+
+var shotIDPattern = regexp.MustCompile(`^E\d{3}-S\d{3}-SH\d{3}$`)
 
 type HTTPServer struct {
 	store             *Store
@@ -26,6 +31,7 @@ type HTTPServer struct {
 	maxUploadBytes    int64
 	paidAllowed       bool
 	miniMaxConfigured bool
+	openAIConfigured  bool
 }
 
 func NewHTTPServer(
@@ -35,10 +41,11 @@ func NewHTTPServer(
 	maxUploadBytes int64,
 	paidAllowed bool,
 	miniMaxConfigured bool,
+	openAIConfigured bool,
 ) http.Handler {
 	s := &HTTPServer{
 		store: store, worker: worker, logger: logger, maxUploadBytes: maxUploadBytes,
-		paidAllowed: paidAllowed, miniMaxConfigured: miniMaxConfigured,
+		paidAllowed: paidAllowed, miniMaxConfigured: miniMaxConfigured, openAIConfigured: openAIConfigured,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.health)
@@ -51,9 +58,22 @@ func NewHTTPServer(
 	mux.HandleFunc("POST /api/scripts", s.createScript)
 	mux.HandleFunc("PATCH /api/scripts/{id}", s.updateScript)
 	mux.HandleFunc("DELETE /api/scripts/{id}", s.deleteScript)
+	mux.HandleFunc("GET /api/shots", s.listShots)
+	mux.HandleFunc("POST /api/shots/import", s.importShots)
+	mux.HandleFunc("PATCH /api/shots/{id}/review", s.reviewShot)
+	mux.HandleFunc("POST /api/shots/{id}/generate", s.generateShot)
+	mux.HandleFunc("POST /api/shots/generate-sequence", s.generateShotSequence)
+	mux.HandleFunc("POST /api/shots/{id}/images/generate", s.generateShotImageSet)
+	mux.HandleFunc("POST /api/shots/images/generate", s.generateShotImages)
+	mux.HandleFunc("POST /api/shots/{id}/assets", s.linkShotAsset)
+	mux.HandleFunc("DELETE /api/shots/{id}/assets/{linkID}", s.unlinkShotAsset)
 	mux.HandleFunc("GET /api/assets", s.listAssets)
 	mux.HandleFunc("POST /api/assets", s.uploadAsset)
+	mux.HandleFunc("POST /api/assets/characters/images/generate", s.generateCharacterImages)
 	mux.HandleFunc("GET /api/assets/{id}/content", s.assetContent)
+	mux.HandleFunc("GET /api/assets/{id}/preview", s.assetPreview)
+	mux.HandleFunc("POST /api/assets/{id}/links", s.createAssetLink)
+	mux.HandleFunc("DELETE /api/assets/{id}/links/{linkID}", s.deleteAssetLink)
 	mux.HandleFunc("DELETE /api/assets/{id}", s.deleteAsset)
 	mux.HandleFunc("GET /api/videos", s.listVideos)
 	mux.HandleFunc("POST /api/videos", s.uploadVideo)
@@ -91,6 +111,7 @@ func (s *HTTPServer) config(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"paid_generation_allowed": s.paidAllowed,
 		"minimax_configured":      s.miniMaxConfigured,
+		"openai_image_configured": s.openAIConfigured,
 		"max_upload_bytes":        s.maxUploadBytes,
 		"providers":               []string{"mock", "minimax"},
 	})
@@ -193,7 +214,9 @@ func (s *HTTPServer) deleteProject(w http.ResponseWriter, r *http.Request) {
 		}
 		state.Projects = deleteBy(state.Projects, func(item Project) bool { return item.ID == id })
 		state.Scripts = deleteBy(state.Scripts, func(item Script) bool { return item.ProjectID == id })
+		state.Shots = deleteBy(state.Shots, func(item Shot) bool { return item.ProjectID == id })
 		state.Assets = deleteBy(state.Assets, func(item Asset) bool { return item.ProjectID == id })
+		state.AssetLinks = deleteBy(state.AssetLinks, func(item AssetLink) bool { return item.ProjectID == id })
 		state.Videos = deleteBy(state.Videos, func(item Video) bool { return item.ProjectID == id })
 		state.Tasks = deleteBy(state.Tasks, func(item Task) bool { return item.ProjectID == id })
 		return nil
@@ -321,16 +344,648 @@ func (s *HTTPServer) deleteScript(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *HTTPServer) listShots(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("project_id")
+	episodeID := r.URL.Query().Get("episode_id")
+	status := r.URL.Query().Get("status")
+	route := r.URL.Query().Get("route")
+	var shots []ShotWithAssets
+	_ = s.store.View(func(state State) error {
+		for _, shot := range state.Shots {
+			if (projectID != "" && shot.ProjectID != projectID) ||
+				(episodeID != "" && shot.EpisodeID != episodeID) ||
+				(status != "" && string(shot.ReviewStatus) != status) ||
+				(route != "" && shot.GenerationRoute != route) {
+				continue
+			}
+			item := ShotWithAssets{Shot: shot}
+			for _, link := range state.AssetLinks {
+				if link.TargetType == "shot" && link.TargetID == shot.ID {
+					item.AssetLinks = append(item.AssetLinks, link)
+				}
+			}
+			shots = append(shots, item)
+		}
+		slices.SortFunc(shots, func(a, b ShotWithAssets) int { return strings.Compare(a.ID, b.ID) })
+		return nil
+	})
+	writeJSON(w, http.StatusOK, shots)
+}
+
+func (s *HTTPServer) importShots(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		ProjectID string `json:"project_id"`
+		Shots     []Shot `json:"shots"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(input.Shots) == 0 || len(input.Shots) > 1000 {
+		writeError(w, http.StatusBadRequest, "shots must contain 1-1000 items")
+		return
+	}
+	seen := make(map[string]bool, len(input.Shots))
+	for i := range input.Shots {
+		shot := &input.Shots[i]
+		shot.ProjectID = input.ProjectID
+		shot.ID = strings.TrimSpace(shot.ID)
+		shot.EpisodeID = strings.TrimSpace(shot.EpisodeID)
+		shot.SceneID = strings.TrimSpace(shot.SceneID)
+		shot.ChapterTitle = strings.TrimSpace(shot.ChapterTitle)
+		shot.Framing = strings.TrimSpace(shot.Framing)
+		shot.Camera = strings.TrimSpace(shot.Camera)
+		shot.Visual = strings.TrimSpace(shot.Visual)
+		shot.Audio = strings.TrimSpace(shot.Audio)
+		shot.SourceMode = strings.TrimSpace(shot.SourceMode)
+		shot.AspectRatio = strings.TrimSpace(shot.AspectRatio)
+		shot.TargetModel = strings.TrimSpace(shot.TargetModel)
+		shot.GenerationRoute = strings.TrimSpace(shot.GenerationRoute)
+		shot.Prompt = strings.TrimSpace(shot.Prompt)
+		shot.NegativePrompt = strings.TrimSpace(shot.NegativePrompt)
+		shot.InputVersion = strings.TrimSpace(shot.InputVersion)
+		if err := validateImportedShot(*shot); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("shot %d: %v", i+1, err))
+			return
+		}
+		if seen[shot.ID] {
+			writeError(w, http.StatusBadRequest, "duplicate shot_id in import: "+shot.ID)
+			return
+		}
+		seen[shot.ID] = true
+	}
+	var imported, skipped int
+	err := s.store.Update(func(state *State) error {
+		if _, err := findProject(state, input.ProjectID); err != nil {
+			return err
+		}
+		existing := make(map[string]bool, len(state.Shots))
+		for _, shot := range state.Shots {
+			existing[shot.ID] = true
+		}
+		now := time.Now().UTC()
+		for _, shot := range input.Shots {
+			if existing[shot.ID] {
+				skipped++
+				continue
+			}
+			shot.ReviewStatus = ShotPending
+			shot.ReviewNote = ""
+			shot.TaskID = ""
+			shot.VideoID = ""
+			shot.CreatedAt = now
+			shot.UpdatedAt = now
+			for i := range state.Videos {
+				video := &state.Videos[i]
+				if video.ProjectID == input.ProjectID && strings.EqualFold(strings.TrimSuffix(video.Filename, filepath.Ext(video.Filename)), shot.ID) {
+					shot.VideoID = video.ID
+					video.ShotID = shot.ID
+					break
+				}
+			}
+			state.Shots = append(state.Shots, shot)
+			existing[shot.ID] = true
+			imported++
+		}
+		return nil
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]int{"imported": imported, "skipped": skipped})
+}
+
+func validateImportedShot(shot Shot) error {
+	if !shotIDPattern.MatchString(shot.ID) {
+		return errors.New("invalid shot_id")
+	}
+	if shot.EpisodeID == "" || shot.SceneID == "" || !strings.HasPrefix(shot.SceneID, shot.EpisodeID+"-") || !strings.HasPrefix(shot.ID, shot.SceneID+"-") {
+		return errors.New("episode_id and scene_id must match shot_id")
+	}
+	if shot.Chapter < 1 || shot.ChapterTitle == "" || shot.Visual == "" || shot.Prompt == "" {
+		return errors.New("chapter, chapter_title, visual, and prompt are required")
+	}
+	if len([]rune(shot.Prompt)) > 7000 || len([]rune(shot.NegativePrompt)) > 3000 {
+		return errors.New("prompt exceeds 7000 or negative_prompt exceeds 3000 characters")
+	}
+	if !slices.Contains([]string{"video_api", "post_production"}, shot.GenerationRoute) {
+		return errors.New("generation_route must be video_api or post_production")
+	}
+	return validateVideoOptions(shot.TargetModel, shot.Duration, "768P", shot.AspectRatio)
+}
+
+func (s *HTTPServer) reviewShot(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Status ShotReviewStatus `json:"status"`
+		Note   string           `json:"note"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !slices.Contains([]ShotReviewStatus{ShotPending, ShotApproved, ShotChangesRequested, ShotRejected}, input.Status) {
+		writeError(w, http.StatusBadRequest, "invalid review status")
+		return
+	}
+	input.Note = strings.TrimSpace(input.Note)
+	if len([]rune(input.Note)) > 2000 {
+		writeError(w, http.StatusBadRequest, "note exceeds 2000 characters")
+		return
+	}
+	var updated Shot
+	err := s.store.Update(func(state *State) error {
+		shot, err := findShot(state, r.PathValue("id"))
+		if err != nil {
+			return err
+		}
+		shot.ReviewStatus = input.Status
+		shot.ReviewNote = input.Note
+		shot.UpdatedAt = time.Now().UTC()
+		updated = *shot
+		return nil
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *HTTPServer) generateShot(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Provider              string `json:"provider"`
+		Resolution            string `json:"resolution"`
+		UseFrameImages        bool   `json:"use_frame_images"`
+		CharacterPromptCount  int    `json:"character_prompt_count"`
+		ReferenceImageIDs     []string `json:"reference_image_ids"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	input.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
+	if input.Provider == "" {
+		input.Provider = "mock"
+	}
+	if input.Resolution == "" {
+		input.Resolution = "768P"
+	}
+	if !slices.Contains([]string{"mock", "minimax"}, input.Provider) {
+		writeError(w, http.StatusBadRequest, "provider must be mock or minimax")
+		return
+	}
+	if input.CharacterPromptCount < 0 || input.CharacterPromptCount > maxCharacterPromptModels {
+		writeError(w, http.StatusBadRequest, "character_prompt_count must be 0-3")
+		return
+	}
+	if input.UseFrameImages && len(input.ReferenceImageIDs) > 0 {
+		writeError(w, http.StatusBadRequest, "frame images and reference images cannot be combined")
+		return
+	}
+	if len(input.ReferenceImageIDs) > maxReferenceImages {
+		writeError(w, http.StatusBadRequest, "reference_image_ids must contain at most 9 items")
+		return
+	}
+	seenReferences := make(map[string]bool, len(input.ReferenceImageIDs))
+	for i, id := range input.ReferenceImageIDs {
+		id = strings.TrimSpace(id)
+		if id == "" || seenReferences[id] {
+			writeError(w, http.StatusBadRequest, "reference_image_ids must contain unique non-empty ids")
+			return
+		}
+		seenReferences[id] = true
+		input.ReferenceImageIDs[i] = id
+	}
+	if input.Provider == "minimax" && (!s.paidAllowed || !s.miniMaxConfigured) {
+		writeError(w, http.StatusConflict, "MiniMax requires MINIMAX_API_KEY and ALLOW_PAID_GENERATION=true")
+		return
+	}
+	var task Task
+	err := s.store.Update(func(state *State) error {
+		shot, err := findShot(state, r.PathValue("id"))
+		if err != nil {
+			return err
+		}
+		if shot.ReviewStatus != ShotApproved {
+			return errors.New("shot must be approved before generation")
+		}
+		if shot.GenerationRoute != "video_api" {
+			return errors.New("shot generation_route must be video_api")
+		}
+		if shot.RequiresEditorialSplit {
+			return errors.New("shot requires editorial split before generation")
+		}
+		for _, existing := range state.Tasks {
+			if existing.ShotID == shot.ID && (existing.Status == TaskQueued || existing.Status == TaskRunning) {
+				return errors.New("shot already has an active task")
+			}
+		}
+		if err := validateVideoOptions(shot.TargetModel, shot.Duration, input.Resolution, shot.AspectRatio); err != nil {
+			return err
+		}
+		id, err := newID("tsk")
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		task = Task{
+			ID: id, ProjectID: shot.ProjectID, ShotID: shot.ID, Kind: "video_generation",
+			Provider: input.Provider, Model: shot.TargetModel, Prompt: shot.Prompt,
+			Duration: shot.Duration, Resolution: input.Resolution, AspectRatio: shot.AspectRatio,
+			Status: TaskQueued, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now,
+			UseFrameImages: input.UseFrameImages, CharacterPromptCount: input.CharacterPromptCount,
+			ReferenceImageIDs: slices.Clone(input.ReferenceImageIDs),
+		}
+		appendTaskLog(&task, "镜头 "+shot.ID+" 生成任务已创建")
+		state.Tasks = append(state.Tasks, task)
+		shot.TaskID = task.ID
+		shot.UpdatedAt = now
+		return nil
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	if err := s.worker.Enqueue(task.ID); err != nil {
+		_ = s.store.Update(func(state *State) error {
+			stored, findErr := findTask(state, task.ID)
+			if findErr == nil {
+				stored.Status = TaskFailed
+				stored.Error = err.Error()
+			}
+			return findErr
+		})
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, task)
+}
+
+func (s *HTTPServer) generateShotSequence(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		ProjectID            string   `json:"project_id"`
+		ShotIDs              []string `json:"shot_ids"`
+		Provider             string   `json:"provider"`
+		Resolution           string   `json:"resolution"`
+		CharacterPromptCount int      `json:"character_prompt_count"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	input.ProjectID = strings.TrimSpace(input.ProjectID)
+	input.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
+	if input.Resolution == "" {
+		input.Resolution = "768P"
+	}
+	if input.ProjectID == "" || len(input.ShotIDs) < 2 || len(input.ShotIDs) > 20 || input.Provider != "minimax" {
+		writeError(w, http.StatusBadRequest, "project_id, 2-20 shot_ids, and provider=minimax are required")
+		return
+	}
+	if input.CharacterPromptCount < 0 || input.CharacterPromptCount > maxCharacterPromptModels {
+		writeError(w, http.StatusBadRequest, "character_prompt_count must be 0-3")
+		return
+	}
+	if !s.paidAllowed || !s.miniMaxConfigured {
+		writeError(w, http.StatusConflict, "MiniMax requires MINIMAX_API_KEY and ALLOW_PAID_GENERATION=true")
+		return
+	}
+	seen := make(map[string]bool, len(input.ShotIDs))
+	for i, id := range input.ShotIDs {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			writeError(w, http.StatusBadRequest, "shot_ids must be unique non-empty ids")
+			return
+		}
+		seen[id] = true
+		input.ShotIDs[i] = id
+	}
+	tasks := []Task{}
+	err := s.store.Update(func(state *State) error {
+		if _, err := findProject(state, input.ProjectID); err != nil {
+			return err
+		}
+		previousTaskID := ""
+		for _, shotID := range input.ShotIDs {
+			shot, err := findShot(state, shotID)
+			if err != nil {
+				return err
+			}
+			if shot.ProjectID != input.ProjectID || shot.ReviewStatus != ShotApproved || shot.GenerationRoute != "video_api" || shot.RequiresEditorialSplit {
+				return errors.New("all sequence shots must pass the generation gate")
+			}
+			for _, task := range state.Tasks {
+				if task.ShotID == shot.ID && (task.Status == TaskQueued || task.Status == TaskRunning) {
+					return fmt.Errorf("shot %s already has an active task", shot.ID)
+				}
+			}
+			if err := validateVideoOptions(shot.TargetModel, shot.Duration, input.Resolution, shot.AspectRatio); err != nil {
+				return err
+			}
+			id, err := newID("tsk")
+			if err != nil {
+				return err
+			}
+			now := time.Now().UTC()
+			task := Task{
+				ID: id, ProjectID: shot.ProjectID, ShotID: shot.ID, Kind: "video_generation",
+				Provider: input.Provider, Model: shot.TargetModel, Prompt: shot.Prompt,
+				Duration: shot.Duration, Resolution: input.Resolution, AspectRatio: shot.AspectRatio,
+				Status: TaskQueued, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now,
+				CharacterPromptCount: input.CharacterPromptCount, PreviousTaskID: previousTaskID,
+			}
+			appendTaskLog(&task, "顺序试片任务已创建")
+			state.Tasks = append(state.Tasks, task)
+			shot.TaskID = task.ID
+			shot.UpdatedAt = now
+			tasks = append(tasks, task)
+			previousTaskID = task.ID
+		}
+		return nil
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	if err := s.worker.Enqueue(tasks[0].ID); err != nil {
+		s.worker.fail(tasks[0].ID, err)
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, tasks)
+}
+
+func (s *HTTPServer) generateShotImages(w http.ResponseWriter, r *http.Request) {
+	if !s.openAIConfigured {
+		writeError(w, http.StatusConflict, "GPT Image 2 requires OPENAI_API_KEY")
+		return
+	}
+	var input struct {
+		ProjectID string `json:"project_id"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	input.ProjectID = strings.TrimSpace(input.ProjectID)
+	if input.ProjectID == "" {
+		writeError(w, http.StatusBadRequest, "project_id is required")
+		return
+	}
+	var queued []Task
+	var skipped int
+	err := s.store.Update(func(state *State) error {
+		if _, err := findProject(state, input.ProjectID); err != nil {
+			return err
+		}
+		shots := make([]Shot, 0)
+		for _, shot := range state.Shots {
+			if shot.ProjectID == input.ProjectID {
+				shots = append(shots, shot)
+			}
+		}
+		slices.SortFunc(shots, func(a, b Shot) int { return strings.Compare(a.ID, b.ID) })
+		for _, shot := range shots {
+			tasks, omitted, err := newShotImageTasks(state, shot)
+			if err != nil {
+				return err
+			}
+			queued = append(queued, tasks...)
+			skipped += omitted
+			state.Tasks = append(state.Tasks, tasks...)
+		}
+		return nil
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	for _, task := range queued {
+		if err := s.worker.Enqueue(task.ID); err != nil {
+			s.worker.fail(task.ID, err)
+		}
+	}
+	writeJSON(w, http.StatusAccepted, map[string]int{"queued": len(queued), "skipped": skipped})
+}
+
+func (s *HTTPServer) generateShotImageSet(w http.ResponseWriter, r *http.Request) {
+	if !s.openAIConfigured {
+		writeError(w, http.StatusConflict, "GPT Image 2 requires OPENAI_API_KEY")
+		return
+	}
+
+	var queued []Task
+	var skipped int
+	err := s.store.Update(func(state *State) error {
+		shot, err := findShot(state, r.PathValue("id"))
+		if err != nil {
+			return err
+		}
+		queued, skipped, err = newShotImageTasks(state, *shot)
+		if err != nil {
+			return err
+		}
+		state.Tasks = append(state.Tasks, queued...)
+		return nil
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	for _, task := range queued {
+		if err := s.worker.Enqueue(task.ID); err != nil {
+			s.worker.fail(task.ID, err)
+		}
+	}
+	writeJSON(w, http.StatusAccepted, map[string]int{"queued": len(queued), "skipped": skipped})
+}
+
+func (s *HTTPServer) generateCharacterImages(w http.ResponseWriter, r *http.Request) {
+	if !s.openAIConfigured {
+		writeError(w, http.StatusConflict, "GPT Image 2 requires OPENAI_API_KEY")
+		return
+	}
+	var input struct {
+		ProjectID string `json:"project_id"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	input.ProjectID = strings.TrimSpace(input.ProjectID)
+	if input.ProjectID == "" {
+		writeError(w, http.StatusBadRequest, "project_id is required")
+		return
+	}
+
+	var characters []Asset
+	if err := s.store.View(func(state State) error {
+		if _, err := findProject(&state, input.ProjectID); err != nil {
+			return err
+		}
+		for _, asset := range state.Assets {
+			if asset.ProjectID == input.ProjectID && asset.Kind == "character" {
+				characters = append(characters, asset)
+			}
+		}
+		return nil
+	}); err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	slices.SortFunc(characters, func(a, b Asset) int { return strings.Compare(a.Name, b.Name) })
+
+	models := make(map[string]string, len(characters))
+	for _, character := range characters {
+		path, err := s.mediaPath(character.StoragePath)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "invalid stored character model path")
+			return
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			s.logger.Error("read character model", "asset_id", character.ID, "error", err)
+			writeError(w, http.StatusInternalServerError, "read character model failed")
+			return
+		}
+		if len(data) == 0 || len(data) > maxTextPreviewBytes {
+			writeError(w, http.StatusConflict, "character model must contain 1 byte to 1 MiB")
+			return
+		}
+		var model map[string]any
+		if json.Unmarshal(data, &model) != nil || len(model) == 0 {
+			writeError(w, http.StatusConflict, "character model must be a non-empty JSON object")
+			return
+		}
+		models[character.ID] = string(data)
+	}
+
+	var queued []Task
+	var skipped int
+	err := s.store.Update(func(state *State) error {
+		if _, err := findProject(state, input.ProjectID); err != nil {
+			return err
+		}
+		for _, character := range characters {
+			if _, err := findAsset(state, character.ID); err != nil {
+				return err
+			}
+			tasks, omitted, err := newCharacterImageTasks(state, character, models[character.ID])
+			if err != nil {
+				return err
+			}
+			queued = append(queued, tasks...)
+			skipped += omitted
+			state.Tasks = append(state.Tasks, tasks...)
+		}
+		return nil
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	for _, task := range queued {
+		if err := s.worker.Enqueue(task.ID); err != nil {
+			s.worker.fail(task.ID, err)
+		}
+	}
+	writeJSON(w, http.StatusAccepted, map[string]int{
+		"characters": len(characters),
+		"queued":     len(queued),
+		"skipped":    skipped,
+	})
+}
+
+func (s *HTTPServer) linkShotAsset(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		AssetID string `json:"asset_id"`
+		Note    string `json:"note"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	input.AssetID = strings.TrimSpace(input.AssetID)
+	input.Note = strings.TrimSpace(input.Note)
+	if input.AssetID == "" || len([]rune(input.Note)) > 500 {
+		writeError(w, http.StatusBadRequest, "asset_id is required and note must not exceed 500 characters")
+		return
+	}
+	var created AssetLink
+	err := s.store.Update(func(state *State) error {
+		shot, err := findShot(state, r.PathValue("id"))
+		if err != nil {
+			return err
+		}
+		var asset *Asset
+		for i := range state.Assets {
+			if state.Assets[i].ID == input.AssetID && state.Assets[i].ProjectID == shot.ProjectID {
+				asset = &state.Assets[i]
+				break
+			}
+		}
+		if asset == nil {
+			return errors.New("resource not found in this project")
+		}
+		for _, link := range state.AssetLinks {
+			if link.AssetID == asset.ID && link.TargetType == "shot" && link.TargetID == shot.ID {
+				return errors.New("resource link already exists")
+			}
+		}
+		id, err := newID("lnk")
+		if err != nil {
+			return err
+		}
+		created = AssetLink{ID: id, ProjectID: shot.ProjectID, AssetID: asset.ID, TargetType: "shot", TargetID: shot.ID, Note: input.Note, CreatedAt: time.Now().UTC()}
+		state.AssetLinks = append(state.AssetLinks, created)
+		return nil
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *HTTPServer) unlinkShotAsset(w http.ResponseWriter, r *http.Request) {
+	err := s.store.Update(func(state *State) error {
+		if _, err := findShot(state, r.PathValue("id")); err != nil {
+			return err
+		}
+		linkID := r.PathValue("linkID")
+		before := len(state.AssetLinks)
+		state.AssetLinks = deleteBy(state.AssetLinks, func(link AssetLink) bool {
+			return link.ID == linkID && link.TargetType == "shot" && link.TargetID == r.PathValue("id")
+		})
+		if len(state.AssetLinks) == before {
+			return ErrNotFound
+		}
+		return nil
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *HTTPServer) listAssets(w http.ResponseWriter, r *http.Request) {
 	projectID := r.URL.Query().Get("project_id")
-	var assets []Asset
+	var assets []AssetWithLinks
 	_ = s.store.View(func(state State) error {
 		for _, asset := range state.Assets {
 			if projectID == "" || asset.ProjectID == projectID {
-				assets = append(assets, asset)
+				item := AssetWithLinks{Asset: asset}
+				for _, link := range state.AssetLinks {
+					if link.AssetID == asset.ID {
+						item.Links = append(item.Links, link)
+					}
+				}
+				assets = append(assets, item)
 			}
 		}
-		slices.SortFunc(assets, func(a, b Asset) int { return b.CreatedAt.Compare(a.CreatedAt) })
+		slices.SortFunc(assets, func(a, b AssetWithLinks) int { return b.CreatedAt.Compare(a.CreatedAt) })
 		return nil
 	})
 	writeJSON(w, http.StatusOK, assets)
@@ -358,6 +1013,163 @@ func (s *HTTPServer) assetContent(w http.ResponseWriter, r *http.Request) {
 	s.serveMedia(w, r, asset.StoragePath, asset.Filename, asset.ContentType)
 }
 
+func (s *HTTPServer) assetPreview(w http.ResponseWriter, r *http.Request) {
+	var asset Asset
+	err := s.store.View(func(state State) error {
+		for _, item := range state.Assets {
+			if item.ID == r.PathValue("id") {
+				asset = item
+				return nil
+			}
+		}
+		return ErrNotFound
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	if !isTextAsset(asset) {
+		writeError(w, http.StatusUnsupportedMediaType, "preview is only available for text and JSON resources")
+		return
+	}
+	path, err := s.mediaPath(asset.StoragePath)
+	if err != nil {
+		s.logger.Error("resolve asset preview", "asset_id", asset.ID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "stored media not found")
+			return
+		}
+		s.logger.Error("read asset preview", "asset_id", asset.ID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	if len(data) > maxTextPreviewBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "preview exceeds 1 MiB")
+		return
+	}
+	content := string(data)
+	if strings.HasSuffix(strings.ToLower(asset.Filename), ".json") {
+		var value any
+		if json.Unmarshal(data, &value) == nil {
+			formatted, err := json.MarshalIndent(value, "", "  ")
+			if err != nil {
+				s.logger.Error("format JSON preview", "asset_id", asset.ID, "error", err)
+				writeError(w, http.StatusInternalServerError, "internal server error")
+				return
+			}
+			content = string(formatted)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"content": content})
+}
+func (s *HTTPServer) createAssetLink(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		TargetType string `json:"target_type"`
+		TargetID   string `json:"target_id"`
+		Note       string `json:"note"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	input.TargetType = strings.TrimSpace(input.TargetType)
+	input.TargetID = strings.TrimSpace(input.TargetID)
+	input.Note = strings.TrimSpace(input.Note)
+	if !slices.Contains([]string{"asset", "video", "shot"}, input.TargetType) || input.TargetID == "" {
+		writeError(w, http.StatusBadRequest, "target_type must be asset, video, or shot and target_id is required")
+		return
+	}
+	if len([]rune(input.Note)) > 500 {
+		writeError(w, http.StatusBadRequest, "note exceeds 500 characters")
+		return
+	}
+	var created AssetLink
+	err := s.store.Update(func(state *State) error {
+		var source Asset
+		found := false
+		for _, asset := range state.Assets {
+			if asset.ID == r.PathValue("id") {
+				source = asset
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ErrNotFound
+		}
+		targetOK := false
+		if input.TargetType == "asset" {
+			for _, target := range state.Assets {
+				if target.ID == input.TargetID && target.ProjectID == source.ProjectID {
+					targetOK = true
+					break
+				}
+			}
+		} else if input.TargetType == "video" {
+			for _, target := range state.Videos {
+				if target.ID == input.TargetID && target.ProjectID == source.ProjectID {
+					targetOK = true
+					break
+				}
+			}
+		} else {
+			for _, target := range state.Shots {
+				if target.ID == input.TargetID && target.ProjectID == source.ProjectID {
+					targetOK = true
+					break
+				}
+			}
+		}
+		if !targetOK {
+			return errors.New("target not found in this project")
+		}
+		for _, link := range state.AssetLinks {
+			if link.AssetID == source.ID && link.TargetType == input.TargetType && link.TargetID == input.TargetID {
+				return errors.New("resource link already exists")
+			}
+		}
+		id, err := newID("lnk")
+		if err != nil {
+			return err
+		}
+		created = AssetLink{
+			ID: id, ProjectID: source.ProjectID, AssetID: source.ID,
+			TargetType: input.TargetType, TargetID: input.TargetID, Note: input.Note, CreatedAt: time.Now().UTC(),
+		}
+		state.AssetLinks = append(state.AssetLinks, created)
+		return nil
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *HTTPServer) deleteAssetLink(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	linkID := r.PathValue("linkID")
+	err := s.store.Update(func(state *State) error {
+		for _, link := range state.AssetLinks {
+			if link.ID == linkID && link.AssetID == assetID {
+				state.AssetLinks = deleteBy(state.AssetLinks, func(item AssetLink) bool { return item.ID == linkID })
+				return nil
+			}
+		}
+		return ErrNotFound
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *HTTPServer) deleteAsset(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var storagePath string
@@ -366,6 +1178,9 @@ func (s *HTTPServer) deleteAsset(w http.ResponseWriter, r *http.Request) {
 			if item.ID == id {
 				storagePath = item.StoragePath
 				state.Assets = deleteBy(state.Assets, func(asset Asset) bool { return asset.ID == id })
+				state.AssetLinks = deleteBy(state.AssetLinks, func(link AssetLink) bool {
+					return link.AssetID == id || (link.TargetType == "asset" && link.TargetID == id)
+				})
 				return nil
 			}
 		}
@@ -388,7 +1203,18 @@ func (s *HTTPServer) listVideos(w http.ResponseWriter, r *http.Request) {
 				videos = append(videos, video)
 			}
 		}
-		slices.SortFunc(videos, func(a, b Video) int { return b.CreatedAt.Compare(a.CreatedAt) })
+		slices.SortFunc(videos, func(a, b Video) int {
+			if a.ShotID != "" && b.ShotID != "" && a.ShotID != b.ShotID {
+				return strings.Compare(a.ShotID, b.ShotID)
+			}
+			if a.ShotID != b.ShotID {
+				if a.ShotID == "" {
+					return 1
+				}
+				return -1
+			}
+			return b.CreatedAt.Compare(a.CreatedAt)
+		})
 		return nil
 	})
 	writeJSON(w, http.StatusOK, videos)
@@ -424,6 +1250,13 @@ func (s *HTTPServer) deleteVideo(w http.ResponseWriter, r *http.Request) {
 			if item.ID == id {
 				storagePath = item.StoragePath
 				state.Videos = deleteBy(state.Videos, func(video Video) bool { return video.ID == id })
+				state.AssetLinks = deleteBy(state.AssetLinks, func(link AssetLink) bool { return link.TargetType == "video" && link.TargetID == id })
+				for i := range state.Shots {
+					if state.Shots[i].VideoID == id {
+						state.Shots[i].VideoID = ""
+						state.Shots[i].UpdatedAt = time.Now().UTC()
+					}
+				}
 				return nil
 			}
 		}
@@ -493,7 +1326,19 @@ func (s *HTTPServer) upload(w http.ResponseWriter, r *http.Request, video bool) 
 			ID: id, ProjectID: projectID, Title: name, Filename: filename,
 			ContentType: contentType, Size: size, StoragePath: relPath, Provider: "upload", CreatedAt: now,
 		}
-		if err := s.store.Update(func(state *State) error { state.Videos = append(state.Videos, item); return nil }); err != nil {
+		if err := s.store.Update(func(state *State) error {
+			for i := range state.Shots {
+				shot := &state.Shots[i]
+				if shot.ProjectID == projectID && strings.EqualFold(strings.TrimSuffix(filename, filepath.Ext(filename)), shot.ID) {
+					item.ShotID = shot.ID
+					shot.VideoID = item.ID
+					shot.UpdatedAt = now
+					break
+				}
+			}
+			state.Videos = append(state.Videos, item)
+			return nil
+		}); err != nil {
 			s.removeMedia(relPath)
 			s.writeStoreError(w, err)
 			return
@@ -569,13 +1414,8 @@ func (s *HTTPServer) saveUpload(
 }
 
 func (s *HTTPServer) serveMedia(w http.ResponseWriter, r *http.Request, storagePath, filename, contentType string) {
-	if !filepath.IsLocal(filepath.FromSlash(storagePath)) {
-		writeError(w, http.StatusInternalServerError, "invalid stored media path")
-		return
-	}
-	path := filepath.Join(s.store.MediaDir(), filepath.FromSlash(storagePath))
-	rel, err := filepath.Rel(s.store.MediaDir(), path)
-	if err != nil || !filepath.IsLocal(rel) {
+	path, err := s.mediaPath(storagePath)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "invalid stored media path")
 		return
 	}
@@ -584,6 +1424,25 @@ func (s *HTTPServer) serveMedia(w http.ResponseWriter, r *http.Request, storageP
 	}
 	w.Header().Set("Content-Disposition", "inline; filename="+strconv.Quote(filename))
 	http.ServeFile(w, r, path)
+}
+
+func (s *HTTPServer) mediaPath(storagePath string) (string, error) {
+	if !filepath.IsLocal(filepath.FromSlash(storagePath)) {
+		return "", errors.New("non-local storage path")
+	}
+	path := filepath.Join(s.store.MediaDir(), filepath.FromSlash(storagePath))
+	rel, err := filepath.Rel(s.store.MediaDir(), path)
+	if err != nil || !filepath.IsLocal(rel) {
+		return "", errors.New("storage path escapes media directory")
+	}
+	return path, nil
+}
+
+func isTextAsset(asset Asset) bool {
+	if strings.HasPrefix(asset.ContentType, "text/") || asset.ContentType == "application/json" {
+		return true
+	}
+	return slices.Contains([]string{".json", ".jsonl", ".md", ".txt", ".py", ".go", ".yaml", ".yml"}, strings.ToLower(filepath.Ext(asset.Filename)))
 }
 
 func (s *HTTPServer) removeMedia(storagePath string) {
@@ -612,84 +1471,7 @@ func (s *HTTPServer) listTasks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HTTPServer) createTask(w http.ResponseWriter, r *http.Request) {
-	var input struct {
-		ProjectID       string `json:"project_id"`
-		Provider        string `json:"provider"`
-		Model           string `json:"model"`
-		Prompt          string `json:"prompt"`
-		FirstFrameImage string `json:"first_frame_image"`
-		Duration        int    `json:"duration"`
-		Resolution      string `json:"resolution"`
-	}
-	if err := decodeJSON(w, r, &input); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	input.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
-	if input.Provider == "" {
-		input.Provider = "mock"
-	}
-	if !slices.Contains([]string{"mock", "minimax"}, input.Provider) {
-		writeError(w, http.StatusBadRequest, "provider must be mock or minimax")
-		return
-	}
-	if input.Provider == "minimax" && (!s.paidAllowed || !s.miniMaxConfigured) {
-		writeError(w, http.StatusConflict, "MiniMax requires MINIMAX_API_KEY and ALLOW_PAID_GENERATION=true")
-		return
-	}
-	input.Prompt = strings.TrimSpace(input.Prompt)
-	if input.Prompt == "" || len([]rune(input.Prompt)) > 2000 {
-		writeError(w, http.StatusBadRequest, "prompt must contain 1-2000 characters")
-		return
-	}
-	input.FirstFrameImage = strings.TrimSpace(input.FirstFrameImage)
-	if input.FirstFrameImage != "" {
-		u, err := url.Parse(input.FirstFrameImage)
-		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || len(input.FirstFrameImage) > 2048 {
-			writeError(w, http.StatusBadRequest, "first_frame_image must be a public HTTPS URL")
-			return
-		}
-	}
-	if err := validateVideoOptions(input.Model, input.FirstFrameImage != "", input.Duration, input.Resolution); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	id, err := newID("tsk")
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to generate task id")
-		return
-	}
-	now := time.Now().UTC()
-	task := Task{
-		ID: id, ProjectID: input.ProjectID, Kind: "video_generation", Provider: input.Provider,
-		Model: input.Model, Prompt: input.Prompt, FirstFrameImage: input.FirstFrameImage,
-		Duration: input.Duration, Resolution: input.Resolution, Status: TaskQueued,
-		MaxAttempts: 3, CreatedAt: now, UpdatedAt: now,
-	}
-	appendTaskLog(&task, "任务已创建")
-	if err := s.store.Update(func(state *State) error {
-		if _, err := findProject(state, input.ProjectID); err != nil {
-			return err
-		}
-		state.Tasks = append(state.Tasks, task)
-		return nil
-	}); err != nil {
-		s.writeStoreError(w, err)
-		return
-	}
-	if err := s.worker.Enqueue(task.ID); err != nil {
-		_ = s.store.Update(func(state *State) error {
-			stored, findErr := findTask(state, task.ID)
-			if findErr == nil {
-				stored.Status = TaskFailed
-				stored.Error = err.Error()
-			}
-			return findErr
-		})
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusAccepted, task)
+	writeError(w, http.StatusConflict, "create generation tasks through an approved shot")
 }
 
 func (s *HTTPServer) cancelTask(w http.ResponseWriter, r *http.Request) {
@@ -708,24 +1490,18 @@ func (s *HTTPServer) retryTask(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func validateVideoOptions(model string, imageToVideo bool, duration int, resolution string) error {
-	t2v := []string{"MiniMax-Hailuo-2.3", "MiniMax-Hailuo-02", "T2V-01-Director", "T2V-01"}
-	i2v := []string{"MiniMax-Hailuo-2.3", "MiniMax-Hailuo-2.3-Fast", "MiniMax-Hailuo-02", "I2V-01-Director", "I2V-01-live", "I2V-01"}
-	allowed := t2v
-	if imageToVideo {
-		allowed = i2v
+func validateVideoOptions(model string, duration int, resolution, aspectRatio string) error {
+	if model != "MiniMax-H3" {
+		return errors.New("model must be MiniMax-H3")
 	}
-	if !slices.Contains(allowed, model) {
-		return errors.New("model is not valid for selected generation mode")
+	if duration < 4 || duration > 15 {
+		return errors.New("duration must be 4-15 seconds")
 	}
-	if duration != 6 && duration != 10 {
-		return errors.New("duration must be 6 or 10 seconds")
+	if !slices.Contains([]string{"768P", "2K"}, resolution) {
+		return errors.New("resolution must be 768P or 2K")
 	}
-	if !slices.Contains([]string{"512P", "720P", "768P", "1080P"}, resolution) {
-		return errors.New("resolution must be 512P, 720P, 768P, or 1080P")
-	}
-	if duration == 10 && (resolution == "1080P" || (!strings.HasPrefix(model, "MiniMax-Hailuo") && resolution != "768P")) {
-		return errors.New("selected model does not support this 10-second resolution")
+	if !slices.Contains([]string{"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}, aspectRatio) {
+		return errors.New("aspect_ratio must be 21:9, 16:9, 4:3, 1:1, 3:4, or 9:16")
 	}
 	return nil
 }
@@ -736,7 +1512,7 @@ func (s *HTTPServer) writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "not found")
 	default:
 		message := err.Error()
-		if strings.Contains(message, "must") || strings.Contains(message, "exceeds") || strings.Contains(message, "active tasks") || strings.Contains(message, "only failed") || strings.Contains(message, "retry limit") || strings.Contains(message, "already") {
+		if strings.Contains(message, "must") || strings.Contains(message, "requires") || strings.Contains(message, "exceeds") || strings.Contains(message, "active task") || strings.Contains(message, "only failed") || strings.Contains(message, "retry limit") || strings.Contains(message, "already") || strings.Contains(message, "not found in this project") {
 			writeError(w, http.StatusConflict, message)
 			return
 		}

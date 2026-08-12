@@ -132,6 +132,24 @@ func findTask(state *State, id string) (*Task, error) {
 	return nil, ErrNotFound
 }
 
+func findShot(state *State, id string) (*Shot, error) {
+	for i := range state.Shots {
+		if state.Shots[i].ID == id {
+			return &state.Shots[i], nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func findAsset(state *State, id string) (*Asset, error) {
+	for i := range state.Assets {
+		if state.Assets[i].ID == id {
+			return &state.Assets[i], nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
 func normalizeName(value string, max int) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" || len([]rune(value)) > max {

@@ -9,15 +9,25 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 )
 
+const (
+	maxCharacterPromptModels = 3
+	maxReferenceImages       = 9
+	maxVideoInputBytes       = 45 << 20
+	maxSingleInputImage      = 5 << 20
+)
+
 type Worker struct {
 	store            *Store
 	providers        map[string]VideoProvider
+	imageProviders   map[string]ImageProvider
 	queue            chan string
 	pollInterval     time.Duration
 	maxDownloadBytes int64
@@ -26,6 +36,8 @@ type Worker struct {
 	mu               sync.Mutex
 	running          map[string]context.CancelFunc
 	wg               sync.WaitGroup
+	imageQueue       chan string
+	imageWG          sync.WaitGroup
 }
 
 func NewWorker(
@@ -38,13 +50,22 @@ func NewWorker(
 	return &Worker{
 		store:            store,
 		providers:        providers,
-		queue:            make(chan string, 100),
+		imageProviders:   map[string]ImageProvider{},
+		queue:            make(chan string, 4096),
+		imageQueue:       make(chan string, 4096),
 		pollInterval:     pollInterval,
 		maxDownloadBytes: maxDownloadBytes,
 		downloadClient:   &http.Client{Timeout: 20 * time.Minute},
 		logger:           logger,
 		running:          make(map[string]context.CancelFunc),
 	}
+}
+
+func (w *Worker) SetImageProvider(name string, provider ImageProvider) {
+	if w.imageProviders == nil {
+		w.imageProviders = map[string]ImageProvider{}
+	}
+	w.imageProviders[name] = provider
 }
 
 func (w *Worker) Start(ctx context.Context, count int) error {
@@ -61,6 +82,16 @@ func (w *Worker) Start(ctx context.Context, count int) error {
 				appendTaskLog(task, "服务重启，任务恢复排队")
 			}
 			if task.Status == TaskQueued {
+				if task.PreviousTaskID != "" {
+					previous, err := findTask(state, task.PreviousTaskID)
+					if err != nil || previous.Status != TaskSucceeded || previous.VideoID == "" {
+						continue
+					}
+				}
+				if task.Kind == "image_generation" && !w.hasImageProvider(task.Provider) {
+					appendTaskLog(task, "图片任务等待图片服务配置")
+					continue
+				}
 				queued = append(queued, task.ID)
 			}
 		}
@@ -72,22 +103,63 @@ func (w *Worker) Start(ctx context.Context, count int) error {
 		w.wg.Add(1)
 		go w.loop(ctx)
 	}
+	w.imageWG.Add(1)
+	go w.imageLoop(ctx)
 	for _, id := range queued {
-		if err := w.Enqueue(id); err != nil {
+		if err := w.enqueueTask(id); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (w *Worker) Wait() { w.wg.Wait() }
+func (w *Worker) hasImageProvider(name string) bool {
+	_, ok := w.imageProviders[name]
+	return ok
+}
+
+func (w *Worker) Wait() {
+	w.wg.Wait()
+	w.imageWG.Wait()
+}
 
 func (w *Worker) Enqueue(taskID string) error {
+	task, err := w.getTask(taskID)
+	if err != nil {
+		return err
+	}
+	if task.Kind == "image_generation" {
+		return w.enqueueImage(taskID)
+	}
+	return w.enqueueVideo(taskID)
+}
+
+func (w *Worker) enqueueTask(taskID string) error {
+	task, err := w.getTask(taskID)
+	if err != nil {
+		return err
+	}
+	if task.Kind == "image_generation" {
+		return w.enqueueImage(taskID)
+	}
+	return w.enqueueVideo(taskID)
+}
+
+func (w *Worker) enqueueVideo(taskID string) error {
 	select {
 	case w.queue <- taskID:
 		return nil
 	default:
 		return errors.New("task queue is full")
+	}
+}
+
+func (w *Worker) enqueueImage(taskID string) error {
+	select {
+	case w.imageQueue <- taskID:
+		return nil
+	default:
+		return errors.New("image task queue is full")
 	}
 }
 
@@ -104,7 +176,7 @@ func (w *Worker) Cancel(taskID string) error {
 		task.Status = TaskCancelled
 		task.UpdatedAt = now
 		task.CompletedAt = &now
-		appendTaskLog(task, "本地任务已取消；MiniMax v1 远端任务不会被终止")
+		appendTaskLog(task, "本地任务已取消；MiniMax H3 V2 远端任务不会被终止")
 		return nil
 	}); err != nil {
 		return err
@@ -127,11 +199,41 @@ func (w *Worker) Retry(taskID string) error {
 		if task.Status != TaskFailed && task.Status != TaskCancelled {
 			return errors.New("only failed or cancelled tasks can be retried")
 		}
+		if task.Kind == "image_generation" {
+			if task.ShotID == "" && task.AssetID == "" {
+				return errors.New("image task is not linked to a shot or asset")
+			}
+			if task.ShotID != "" {
+				if _, err := findShot(state, task.ShotID); err != nil {
+					return err
+				}
+			}
+			if task.AssetID != "" {
+				if _, err := findAsset(state, task.AssetID); err != nil {
+					return err
+				}
+			}
+		} else {
+			if task.ShotID == "" {
+				return errors.New("task is not linked to a shot")
+			}
+			shot, err := findShot(state, task.ShotID)
+			if err != nil {
+				return err
+			}
+			if shot.ReviewStatus != ShotApproved || shot.GenerationRoute != "video_api" || shot.RequiresEditorialSplit {
+				return errors.New("shot must pass generation gate before retry")
+			}
+		}
 		if task.Status == TaskFailed {
-			if task.Attempts >= task.MaxAttempts {
+			if task.Kind == "image_generation" && task.Attempts >= task.MaxAttempts {
+				task.Attempts = 0
+				appendTaskLog(task, "手动重试，重置图片自动重试计数")
+			}
+			if task.Kind != "image_generation" && task.Attempts >= task.MaxAttempts {
 				return fmt.Errorf("retry limit reached (%d attempts)", task.MaxAttempts)
 			}
-			task.ProviderFileID = ""
+			task.ProviderOutputURL = ""
 		}
 		task.Status = TaskQueued
 		task.Progress = 0
@@ -158,6 +260,18 @@ func (w *Worker) loop(ctx context.Context) {
 	}
 }
 
+func (w *Worker) imageLoop(ctx context.Context) {
+	defer w.imageWG.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case taskID := <-w.imageQueue:
+			w.run(ctx, taskID)
+		}
+	}
+}
+
 func (w *Worker) run(parent context.Context, taskID string) {
 	ctx, cancel := context.WithCancel(parent)
 	w.mu.Lock()
@@ -179,6 +293,10 @@ func (w *Worker) run(parent context.Context, taskID string) {
 	if err != nil || task.Status != TaskQueued {
 		return
 	}
+	if task.Kind == "image_generation" {
+		w.runImage(ctx, task)
+		return
+	}
 	provider, ok := w.providers[task.Provider]
 	if !ok {
 		w.fail(taskID, fmt.Errorf("unknown provider %q", task.Provider))
@@ -197,13 +315,21 @@ func (w *Worker) run(parent context.Context, taskID string) {
 			w.fail(taskID, fmt.Errorf("retry limit reached (%d attempts)", task.MaxAttempts))
 			return
 		}
+		task, _ = w.getTask(taskID)
+		if task.Provider == "minimax" {
+			prepared, err := w.prepareVideoTask(task)
+			if err != nil {
+				w.fail(taskID, err)
+				return
+			}
+			task = prepared
+		}
 		if err := w.updateTask(taskID, func(task *Task) {
 			task.Attempts++
 			appendTaskLog(task, fmt.Sprintf("提交到 %s，第 %d 次", task.Provider, task.Attempts))
 		}); err != nil {
 			return
 		}
-		task, _ = w.getTask(taskID)
 		providerTaskID, err := provider.Submit(ctx, task)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -239,8 +365,6 @@ func (w *Worker) run(parent context.Context, taskID string) {
 		} else {
 			pollErrors = 0
 			switch result.Status {
-			case ProviderPreparing:
-				_ = w.setProgress(taskID, 25, "远端准备中")
 			case ProviderQueueing:
 				_ = w.setProgress(taskID, 35, "远端排队中")
 			case ProviderProcessing:
@@ -253,11 +377,11 @@ func (w *Worker) run(parent context.Context, taskID string) {
 				w.fail(taskID, errors.New("provider reported failure"))
 				return
 			case ProviderSuccess:
-				if result.FileID == "" {
+				if result.DownloadURL == "" {
 					w.succeedWithoutFile(taskID)
 					return
 				}
-				if err := w.completeVideo(ctx, taskID, provider, result.FileID); err != nil {
+				if err := w.completeVideo(ctx, taskID, result.DownloadURL); err != nil {
 					if ctx.Err() == nil {
 						w.fail(taskID, err)
 					}
@@ -275,6 +399,342 @@ func (w *Worker) run(parent context.Context, taskID string) {
 			return
 		case <-timer.C:
 		}
+	}
+}
+
+func (w *Worker) sequenceFrame(task Task) (VideoInput, error) {
+	if task.PreviousTaskID == "" {
+		return VideoInput{}, errors.New("sequence task has no previous task")
+	}
+	var previous Task
+	var video Video
+	err := w.store.View(func(state State) error {
+		storedPrevious, err := findTask(&state, task.PreviousTaskID)
+		if err != nil {
+			return err
+		}
+		previous = *storedPrevious
+		if previous.Status != TaskSucceeded || previous.VideoID == "" {
+			return errors.New("previous sequence video is not ready")
+		}
+		for _, item := range state.Videos {
+			if item.ID == previous.VideoID {
+				video = item
+				return nil
+			}
+		}
+		return ErrNotFound
+	})
+	if err != nil {
+		return VideoInput{}, fmt.Errorf("load previous sequence video: %w", err)
+	}
+	path, err := mediaPath(w.store.MediaDir(), video.StoragePath)
+	if err != nil {
+		return VideoInput{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "ffmpeg", "-v", "error", "-sseof", "-0.1", "-i", path, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1").Output()
+	if err != nil {
+		return VideoInput{}, fmt.Errorf("extract previous video last frame: %w", err)
+	}
+	if len(output) == 0 || len(output) > maxSingleInputImage {
+		return VideoInput{}, errors.New("previous video last frame has invalid size")
+	}
+	return VideoInput{Role: "first_frame", ContentType: "image/png", Data: output}, nil
+}
+
+func (w *Worker) prepareVideoTask(task Task) (Task, error) {
+	if task.PreviousTaskID != "" {
+		input, err := w.sequenceFrame(task)
+		if err != nil {
+			return Task{}, fmt.Errorf("prepare sequence first frame: %w", err)
+		}
+		task.VideoInputs = []VideoInput{input}
+	}
+	err := w.store.View(func(state State) error {
+		shot, err := findShot(&state, task.ShotID)
+		if err != nil {
+			return err
+		}
+		if task.CharacterPromptCount > 0 {
+			addition, err := characterPrompt(w.store.MediaDir(), state, *shot, task.CharacterPromptCount)
+			if err != nil {
+				return err
+			}
+			task.Prompt += addition
+		}
+		if task.PreviousTaskID != "" {
+			return nil
+		}
+		if task.UseFrameImages {
+			inputs, err := frameImages(w.store.MediaDir(), state, *shot)
+			if err != nil {
+				return err
+			}
+			task.VideoInputs = inputs
+		} else if len(task.ReferenceImageIDs) > 0 {
+			inputs, err := referenceImages(w.store.MediaDir(), state, task)
+			if err != nil {
+				return err
+			}
+			task.VideoInputs = inputs
+		}
+		return nil
+	})
+	if err != nil {
+		return Task{}, fmt.Errorf("prepare video inputs: %w", err)
+	}
+	return task, nil
+}
+
+func referenceImages(mediaDir string, state State, task Task) ([]VideoInput, error) {
+	inputs := make([]VideoInput, 0, len(task.ReferenceImageIDs))
+	var totalBytes int
+	for _, assetID := range task.ReferenceImageIDs {
+		asset, err := findAsset(&state, assetID)
+		if err != nil {
+			return nil, fmt.Errorf("reference image %q: %w", assetID, err)
+		}
+		if asset.ProjectID != task.ProjectID || !isVideoInputImage(*asset) {
+			return nil, fmt.Errorf("reference image %q is not an eligible project image", assetID)
+		}
+		input, err := readVideoInput(mediaDir, *asset, "reference_image")
+		if err != nil {
+			return nil, err
+		}
+		totalBytes += len(input.Data)
+		if totalBytes > maxVideoInputBytes {
+			return nil, errors.New("reference images exceed the MiniMax request size limit")
+		}
+		inputs = append(inputs, input)
+	}
+	return inputs, nil
+}
+
+func characterPrompt(mediaDir string, state State, shot Shot, limit int) (string, error) {
+	models := []string{}
+	for _, link := range state.AssetLinks {
+		if link.TargetType != "shot" || link.TargetID != shot.ID {
+			continue
+		}
+		asset, err := findAsset(&state, link.AssetID)
+		if err != nil || asset.Kind != "character" {
+			continue
+		}
+		path, err := mediaPath(mediaDir, asset.StoragePath)
+		if err != nil {
+			return "", err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read character model %q: %w", asset.Name, err)
+		}
+		if len(data) > maxTextPreviewBytes {
+			return "", fmt.Errorf("character model %q exceeds 1 MiB", asset.Name)
+		}
+		models = append(models, string(data))
+		if len(models) == limit {
+			break
+		}
+	}
+	if len(models) == 0 {
+		return "", errors.New("no linked character models available for prompt")
+	}
+	addition := "\n\n角色模型约束（必须遵守）：\n" + strings.Join(models, "\n\n")
+	if len([]rune(shot.Prompt+addition)) > 7000 {
+		return "", errors.New("character models make prompt exceed MiniMax 7000-character limit")
+	}
+	return addition, nil
+}
+
+func frameImages(mediaDir string, state State, shot Shot) ([]VideoInput, error) {
+	roles := map[string]VideoInput{}
+	for _, link := range state.AssetLinks {
+		if link.TargetType != "shot" || link.TargetID != shot.ID || !strings.HasPrefix(link.Note, "GPT Image 2 ") {
+			continue
+		}
+		role := ""
+		switch strings.TrimPrefix(link.Note, "GPT Image 2 ") {
+		case "首帧图":
+			role = "first_frame"
+		case "末帧图":
+			role = "last_frame"
+		}
+		if role == "" || roles[role].Data != nil {
+			continue
+		}
+		asset, err := findAsset(&state, link.AssetID)
+		if err != nil || !isVideoInputImage(*asset) {
+			continue
+		}
+		input, err := readVideoInput(mediaDir, *asset, role)
+		if err != nil {
+			return nil, err
+		}
+		roles[role] = input
+	}
+	first, hasFirst := roles["first_frame"]
+	last, hasLast := roles["last_frame"]
+	if !hasFirst || !hasLast {
+		return nil, errors.New("first_last_frame shot needs generated first and last frame images")
+	}
+	return []VideoInput{first, last}, nil
+}
+
+func isVideoInputImage(asset Asset) bool {
+	return slices.Contains([]string{"image/jpeg", "image/png", "image/webp"}, asset.ContentType) &&
+		asset.Size > 0 && asset.Size <= maxSingleInputImage
+}
+
+func readVideoInput(mediaDir string, asset Asset, role string) (VideoInput, error) {
+	path, err := mediaPath(mediaDir, asset.StoragePath)
+	if err != nil {
+		return VideoInput{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return VideoInput{}, fmt.Errorf("read %s: %w", role, err)
+	}
+	if len(data) == 0 || len(data) > maxSingleInputImage {
+		return VideoInput{}, fmt.Errorf("%s image has invalid size", role)
+	}
+	return VideoInput{Role: role, ContentType: asset.ContentType, Data: data}, nil
+}
+
+func mediaPath(mediaDir, storagePath string) (string, error) {
+	if !filepath.IsLocal(filepath.FromSlash(storagePath)) {
+		return "", errors.New("invalid storage path")
+	}
+	path := filepath.Join(mediaDir, filepath.FromSlash(storagePath))
+	rel, err := filepath.Rel(mediaDir, path)
+	if err != nil || !filepath.IsLocal(rel) {
+		return "", errors.New("storage path escapes media directory")
+	}
+	return path, nil
+}
+
+func (w *Worker) runImage(ctx context.Context, task Task) {
+	provider, ok := w.imageProviders[task.Provider]
+	if !ok {
+		w.fail(task.ID, fmt.Errorf("unknown image provider %q", task.Provider))
+		return
+	}
+	if task.Attempts >= task.MaxAttempts {
+		w.fail(task.ID, fmt.Errorf("retry limit reached (%d attempts)", task.MaxAttempts))
+		return
+	}
+	if err := w.updateTask(task.ID, func(task *Task) {
+		task.Status = TaskRunning
+		task.Progress = 10
+		task.Attempts++
+		appendTaskLog(task, fmt.Sprintf("提交到 %s，第 %d 次", task.Provider, task.Attempts))
+	}); err != nil {
+		return
+	}
+	image, contentType, err := provider.Generate(ctx, task)
+	if err != nil {
+		if ctx.Err() == nil {
+			w.fail(task.ID, fmt.Errorf("generate image: %w", err))
+		}
+		return
+	}
+	if err := w.completeImage(task.ID, image, contentType); err != nil && ctx.Err() == nil {
+		w.fail(task.ID, err)
+	}
+}
+
+func (w *Worker) completeImage(taskID string, image []byte, contentType string) error {
+	if len(image) == 0 || len(image) > 20<<20 {
+		return errors.New("image has invalid size")
+	}
+	task, err := w.getTask(taskID)
+	if err != nil {
+		return err
+	}
+	targetID := task.ShotID
+	if targetID == "" {
+		targetID = task.AssetID
+	}
+	if targetID == "" {
+		return errors.New("image task has no target")
+	}
+	filename := targetID + "-" + task.ImageRole + ".png"
+	dir := filepath.Join(w.store.MediaDir(), task.ProjectID, "assets", taskID)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("create image directory: %w", err)
+	}
+	path := filepath.Join(dir, filename)
+	if err := os.WriteFile(path, image, 0o600); err != nil {
+		return fmt.Errorf("store image: %w", err)
+	}
+	assetID, err := newID("ast")
+	if err != nil {
+		return err
+	}
+	linkID, err := newID("lnk")
+	if err != nil {
+		return err
+	}
+	relPath, err := filepath.Rel(w.store.MediaDir(), path)
+	if err != nil {
+		return fmt.Errorf("resolve image path: %w", err)
+	}
+	return w.store.Update(func(state *State) error {
+		storedTask, err := findTask(state, taskID)
+		if err != nil {
+			return err
+		}
+		if storedTask.Status == TaskCancelled {
+			return context.Canceled
+		}
+		now := time.Now().UTC()
+		name := imageRoleName(task.ImageRole)
+		targetType := "shot"
+		linkNote := "GPT Image 2 " + name
+		if task.AssetID != "" {
+			character, err := findAsset(state, task.AssetID)
+			if err != nil {
+				return err
+			}
+			name = character.Name + " · " + imageRoleName(task.ImageRole)
+			targetType = "asset"
+			linkNote = "GPT Image 2 角色" + imageRoleName(task.ImageRole)
+		}
+		state.Assets = append(state.Assets, Asset{
+			ID: assetID, ProjectID: task.ProjectID, Name: name, Kind: "image",
+			Filename: filename, ContentType: contentType, Size: int64(len(image)),
+			StoragePath: filepath.ToSlash(relPath), CreatedAt: now,
+		})
+		state.AssetLinks = append(state.AssetLinks, AssetLink{
+			ID: linkID, ProjectID: task.ProjectID, AssetID: assetID, TargetType: targetType,
+			TargetID: targetID, Note: linkNote, CreatedAt: now,
+		})
+		storedTask.Status = TaskSucceeded
+		storedTask.Progress = 100
+		storedTask.UpdatedAt = now
+		storedTask.CompletedAt = &now
+		appendTaskLog(storedTask, "图片已生成并关联"+map[string]string{"shot": "镜头", "asset": "角色素材"}[targetType])
+		return nil
+	})
+}
+
+func imageRoleName(role string) string {
+	switch role {
+	case "first-frame":
+		return "首帧图"
+	case "last-frame":
+		return "末帧图"
+	case "preview":
+		return "预览图"
+	case "effect-front":
+		return "正面效果图"
+	case "effect-profile":
+		return "侧面效果图"
+	case "effect-action":
+		return "动作效果图"
+	default:
+		return "镜头图片"
 	}
 }
 
@@ -330,6 +790,23 @@ func (w *Worker) fail(id string, cause error) {
 		task.UpdatedAt = now
 		task.CompletedAt = &now
 		appendTaskLog(task, "失败: "+cause.Error())
+		blockedBy := map[string]bool{id: true}
+		for changed := true; changed; {
+			changed = false
+			for i := range state.Tasks {
+				candidate := &state.Tasks[i]
+				if !blockedBy[candidate.PreviousTaskID] || candidate.Status != TaskQueued {
+					continue
+				}
+				candidate.Status = TaskCancelled
+				candidate.Error = "previous sequence task failed"
+				candidate.UpdatedAt = now
+				candidate.CompletedAt = &now
+				appendTaskLog(candidate, "前序试片失败，后续镜头未提交")
+				blockedBy[candidate.ID] = true
+				changed = true
+			}
+		}
 		return nil
 	}); err != nil && !errors.Is(err, ErrNotFound) {
 		w.logger.Error("persist task failure", "task_id", id, "error", err)
@@ -354,25 +831,15 @@ func (w *Worker) succeedWithoutFile(id string) {
 	}
 }
 
-func (w *Worker) completeVideo(ctx context.Context, taskID string, provider VideoProvider, fileID string) error {
+func (w *Worker) completeVideo(ctx context.Context, taskID, downloadURL string) error {
 	if err := w.setProgress(taskID, 85, "生成完成，准备下载"); err != nil {
 		return err
-	}
-	info, err := provider.Retrieve(ctx, fileID)
-	if err != nil {
-		return fmt.Errorf("retrieve output: %w", err)
-	}
-	if info.Size > w.maxDownloadBytes {
-		return fmt.Errorf("video exceeds download limit of %d bytes", w.maxDownloadBytes)
 	}
 	task, err := w.getTask(taskID)
 	if err != nil {
 		return err
 	}
-	filename := safeFilename(info.Filename)
-	if filename == "" {
-		filename = taskID + ".mp4"
-	}
+	filename := taskID + ".mp4"
 	dir := filepath.Join(w.store.MediaDir(), task.ProjectID, "videos", taskID)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("create video directory: %w", err)
@@ -383,7 +850,7 @@ func (w *Worker) completeVideo(ctx context.Context, taskID string, provider Vide
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, info.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("create video download request: %w", err)
@@ -434,7 +901,8 @@ func (w *Worker) completeVideo(ctx context.Context, taskID string, provider Vide
 	if contentType == "" {
 		contentType = mime.TypeByExtension(filepath.Ext(filename))
 	}
-	return w.store.Update(func(state *State) error {
+	var nextTaskID string
+	err = w.store.Update(func(state *State) error {
 		storedTask, err := findTask(state, taskID)
 		if err != nil {
 			return err
@@ -444,20 +912,151 @@ func (w *Worker) completeVideo(ctx context.Context, taskID string, provider Vide
 		}
 		now := time.Now().UTC()
 		state.Videos = append(state.Videos, Video{
-			ID: videoID, ProjectID: task.ProjectID, TaskID: taskID,
+			ID: videoID, ProjectID: task.ProjectID, TaskID: taskID, ShotID: task.ShotID,
 			Title: task.Prompt, Filename: filename, ContentType: contentType,
 			Size: written, StoragePath: filepath.ToSlash(relPath),
 			Provider: task.Provider, Model: task.Model, CreatedAt: now,
 		})
 		storedTask.Status = TaskSucceeded
 		storedTask.Progress = 100
-		storedTask.ProviderFileID = fileID
+		storedTask.ProviderOutputURL = downloadURL
 		storedTask.VideoID = videoID
+		if storedTask.ShotID != "" {
+			if shot, err := findShot(state, storedTask.ShotID); err == nil {
+				shot.VideoID = videoID
+				shot.TaskID = taskID
+				shot.UpdatedAt = now
+			}
+		}
 		storedTask.UpdatedAt = now
 		storedTask.CompletedAt = &now
 		appendTaskLog(storedTask, "视频已下载并入库")
+		for i := range state.Tasks {
+			candidate := &state.Tasks[i]
+			if candidate.PreviousTaskID == taskID && candidate.Status == TaskQueued {
+				nextTaskID = candidate.ID
+				appendTaskLog(candidate, "前序视频已完成，等待提取末帧后提交")
+				break
+			}
+		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if nextTaskID != "" {
+		if err := w.Enqueue(nextTaskID); err != nil {
+			w.fail(nextTaskID, fmt.Errorf("enqueue after previous sequence video: %w", err))
+		}
+	}
+	return nil
+}
+
+func newShotImageTasks(state *State, shot Shot) ([]Task, int, error) {
+	tasks := make([]Task, 0, 3)
+	skipped := 0
+	for _, role := range []string{"first-frame", "last-frame", "preview"} {
+		if hasShotImageTask(*state, shot.ID, role) {
+			skipped++
+			continue
+		}
+		id, err := newID("tsk")
+		if err != nil {
+			return nil, 0, err
+		}
+		now := time.Now().UTC()
+		task := Task{
+			ID: id, ProjectID: shot.ProjectID, ShotID: shot.ID, Kind: "image_generation",
+			Provider: "openai", Model: "gpt-image-2", Prompt: imagePrompt(shot, role), ImageRole: role,
+			AspectRatio: shot.AspectRatio, Status: TaskQueued, MaxAttempts: 2, CreatedAt: now, UpdatedAt: now,
+		}
+		appendTaskLog(&task, "创建 "+imageRoleName(role))
+		tasks = append(tasks, task)
+	}
+	return tasks, skipped, nil
+}
+
+func newCharacterImageTasks(state *State, character Asset, model string) ([]Task, int, error) {
+	tasks := make([]Task, 0, 4)
+	skipped := 0
+	for _, role := range []string{"preview", "effect-front", "effect-profile", "effect-action"} {
+		if hasCharacterImageTask(*state, character.ID, role) {
+			skipped++
+			continue
+		}
+		id, err := newID("tsk")
+		if err != nil {
+			return nil, 0, err
+		}
+		now := time.Now().UTC()
+		task := Task{
+			ID: id, ProjectID: character.ProjectID, AssetID: character.ID, Kind: "image_generation",
+			Provider: "openai", Model: "gpt-image-2", Prompt: characterImagePrompt(character, model, role), ImageRole: role,
+			AspectRatio: "1:1", Status: TaskQueued, MaxAttempts: 2, CreatedAt: now, UpdatedAt: now,
+		}
+		appendTaskLog(&task, "创建角色"+imageRoleName(role))
+		tasks = append(tasks, task)
+	}
+	return tasks, skipped, nil
+}
+
+func hasCharacterImageTask(state State, assetID, role string) bool {
+	for _, task := range state.Tasks {
+		if task.AssetID == assetID && task.Kind == "image_generation" && task.ImageRole == role &&
+			(task.Status == TaskQueued || task.Status == TaskRunning || task.Status == TaskSucceeded) {
+			return true
+		}
+	}
+	return false
+}
+
+func characterImagePrompt(character Asset, model, role string) string {
+	roleInstruction := "Create a clean square character key art preview, full body, neutral three-quarter standing pose, readable face and silhouette."
+	if strings.HasPrefix(character.Filename, "group-") {
+		roleInstruction = "Create a clean square unit key art preview showing a readable lineup of the distinct group members, with correct species, scale, equipment, and formation."
+	}
+	switch role {
+	case "effect-front":
+		roleInstruction = "Create a square full-body front-view character turnaround effect image, neutral stance, readable costume, equipment, face, hair, and silhouette."
+		if strings.HasPrefix(character.Filename, "group-") {
+			roleInstruction = "Create a square front-facing unit lineup effect image, showing distinct group members, correct relative scale, equipment, and formation."
+		}
+	case "effect-profile":
+		roleInstruction = "Create a square full-body side-profile character turnaround effect image, neutral stance, readable costume layers, equipment, hair, and silhouette."
+		if strings.HasPrefix(character.Filename, "group-") {
+			roleInstruction = "Create a square side-profile unit formation effect image, showing distinct group members, correct relative scale, equipment, and spacing."
+		}
+	case "effect-action":
+		roleInstruction = "Create a square cinematic character effect image showing one natural signature action and baseline personality, with full body readable and no combat impact."
+		if strings.HasPrefix(character.Filename, "group-") {
+			roleInstruction = "Create a square cinematic unit effect image showing one coordinated signature formation action, with all members readable and no combat impact."
+		}
+	}
+	return roleInstruction +
+		"\n\nCharacter asset: " + character.Name +
+		"\n\nAuthoritative character model JSON:\n" + model +
+		"\n\nKeep exact identity, age, body scale, face, hair, eye color, costume, equipment, and timeline restrictions. Plain restrained background. No text, labels, logos, watermarks, collage, split panels, duplicate character, injury, blood, or gore."
+}
+
+func hasShotImageTask(state State, shotID, role string) bool {
+	for _, task := range state.Tasks {
+		if task.ShotID == shotID && task.Kind == "image_generation" && task.ImageRole == role &&
+			(task.Status == TaskQueued || task.Status == TaskRunning || task.Status == TaskSucceeded) {
+			return true
+		}
+	}
+	return false
+}
+
+func imagePrompt(shot Shot, role string) string {
+	roleInstruction := "Create a clean, compelling preview image that represents this shot."
+	if role == "first-frame" {
+		roleInstruction = "Create first frame of this shot, before motion begins. Preserve composition, character identity, costume, location, and lighting."
+	}
+	if role == "last-frame" {
+		roleInstruction = "Create final frame of this shot, after described action completes. Preserve composition, character identity, costume, location, and lighting."
+	}
+	return roleInstruction + "\n\nShot visual: " + shot.Visual + "\n\nProduction prompt:\n" + shot.Prompt + "\n\nNo text, no logos, no watermarks."
 }
 
 func safeFilename(name string) string {

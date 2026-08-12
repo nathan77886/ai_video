@@ -11,11 +11,14 @@ COPY go.mod ./
 COPY backend/ ./backend/
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/ai-video ./backend/src/cmd/server
 
+FROM mwader/static-ffmpeg:6.1.1 AS ffmpeg
+
 FROM nginx:1.29-alpine
 RUN mkdir -p /app /data /tmp/nginx/client_temp /tmp/nginx/proxy_temp \
         /tmp/nginx/fastcgi_temp /tmp/nginx/uwsgi_temp /tmp/nginx/scgi_temp \
     && chown -R nginx:nginx /app /data /tmp/nginx
 COPY --from=backend-build --chown=nginx:nginx /out/ai-video /app/ai-video
+COPY --from=ffmpeg --chown=nginx:nginx /ffmpeg /usr/local/bin/ffmpeg
 COPY --from=frontend-build --chown=nginx:nginx /src/frontend/dist /usr/share/nginx/html
 COPY --chown=nginx:nginx deploy/nginx.conf /etc/nginx/nginx.conf
 COPY --chown=nginx:nginx deploy/entrypoint.sh /app/entrypoint.sh

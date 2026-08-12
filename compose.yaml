@@ -3,16 +3,21 @@ services:
     build: .
     image: ai-video:local
     restart: unless-stopped
+    env_file:
+      - ../.env
     ports:
-      - "0.0.0.0:${APP_PORT:-8080}:8080"
+      - "0.0.0.0:${APP_PORT:-8081}:8080"
     environment:
-      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
-      MINIMAX_BASE_URL: "${MINIMAX_BASE_URL:-https://api.minimax.io}"
-      ALLOW_PAID_GENERATION: "${ALLOW_PAID_GENERATION:-false}"
       WORKER_COUNT: "${WORKER_COUNT:-2}"
       POLL_INTERVAL: "${POLL_INTERVAL:-10s}"
       MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-262144000}"
       MAX_DOWNLOAD_BYTES: "${MAX_DOWNLOAD_BYTES:-2147483648}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_API_KEY_FILE: "${OPENAI_API_KEY_FILE:-/run/secrets/openai_api_key}"
+    secrets:
+      - openai_api_key
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ai-video-data:/data
     healthcheck:
@@ -23,3 +28,7 @@ services:
 
 volumes:
   ai-video-data:
+
+secrets:
+  openai_api_key:
+    file: "${OPENAI_API_KEY_SECRET_FILE:-/mnt/ssd/cli-proxy-api/ai-video-openai.key}"

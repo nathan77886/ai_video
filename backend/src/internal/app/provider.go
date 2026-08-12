@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +19,6 @@ import (
 type ProviderStatus string
 
 const (
-	ProviderPreparing  ProviderStatus = "preparing"
 	ProviderQueueing   ProviderStatus = "queueing"
 	ProviderProcessing ProviderStatus = "processing"
 	ProviderSuccess    ProviderStatus = "success"
@@ -26,20 +26,119 @@ const (
 )
 
 type ProviderResult struct {
-	Status ProviderStatus
-	FileID string
-}
-
-type DownloadInfo struct {
-	URL      string
-	Filename string
-	Size     int64
+	Status      ProviderStatus
+	DownloadURL string
 }
 
 type VideoProvider interface {
 	Submit(context.Context, Task) (string, error)
 	Poll(context.Context, string) (ProviderResult, error)
-	Retrieve(context.Context, string) (DownloadInfo, error)
+}
+
+type ImageProvider interface {
+	Generate(context.Context, Task) ([]byte, string, error)
+}
+
+type OpenAIImageProvider struct {
+	baseURL string
+	apiKey  string
+	client  *http.Client
+}
+
+const imageRequestTimeout = 8 * time.Minute
+
+func NewOpenAIImageProvider(baseURL, apiKey string) (*OpenAIImageProvider, error) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return nil, errors.New("OpenAI image base URL is required")
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Host == "" || u.User != nil ||
+		(u.Scheme != "https" && !(u.Scheme == "http" && isLoopbackHost(u.Hostname()))) {
+		return nil, errors.New("invalid OpenAI image base URL")
+	}
+	return &OpenAIImageProvider{
+		baseURL: baseURL,
+		apiKey:  strings.TrimSpace(apiKey),
+		client:  &http.Client{Timeout: imageRequestTimeout},
+	}, nil
+}
+
+func (p *OpenAIImageProvider) Generate(ctx context.Context, task Task) ([]byte, string, error) {
+	if p.apiKey == "" {
+		return nil, "", errors.New("OPENAI_API_KEY is not configured")
+	}
+	payload := map[string]any{
+		"model":         "gpt-image-2",
+		"prompt":        imageGenerationPrompt(task),
+		"size":          imageSize(task.AspectRatio),
+		"quality":       "low",
+		"output_format": "png",
+		"moderation":    "auto",
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, "", fmt.Errorf("encode OpenAI image request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/images/generations", bytes.NewReader(data))
+	if err != nil {
+		return nil, "", fmt.Errorf("create OpenAI image request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("call OpenAI image API: %w", err)
+	}
+	defer resp.Body.Close()
+	limited := io.LimitReader(resp.Body, 20<<20)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		message, _ := io.ReadAll(limited)
+		return nil, "", fmt.Errorf("OpenAI image API returned %s: %s", resp.Status, strings.TrimSpace(string(message)))
+	}
+	var response struct {
+		Data []struct {
+			B64JSON string `json:"b64_json"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(limited).Decode(&response); err != nil {
+		return nil, "", fmt.Errorf("decode OpenAI image response: %w", err)
+	}
+	if len(response.Data) != 1 || response.Data[0].B64JSON == "" {
+		return nil, "", errors.New("OpenAI image response missing image data")
+	}
+	image, err := base64.StdEncoding.DecodeString(response.Data[0].B64JSON)
+	if err != nil {
+		return nil, "", fmt.Errorf("decode OpenAI image data: %w", err)
+	}
+	if len(image) == 0 || len(image) > 20<<20 {
+		return nil, "", errors.New("OpenAI image response has invalid image size")
+	}
+	return image, "image/png", nil
+}
+
+func imageGenerationPrompt(task Task) string {
+	if task.AssetID != "" {
+		return "Create safe, non-graphic character design artwork. Show intact characters only. No injury, blood, gore, corpses, dismemberment, torture, or weapon impact.\n\n" + task.Prompt
+	}
+	return imageSafetyPrompt(task.Prompt)
+}
+
+func imageSafetyPrompt(prompt string) string {
+	return "Create a PG-13 cinematic still. Show only a tense, non-graphic aftermath or pre-action moment. " +
+		"All characters are intact. No injury, blood, gore, corpses, dismemberment, torture, or weapon impact. " +
+		"If conflict is implied, use distance, defensive poses, atmospheric light, smoke, silhouettes, or an empty environment.\n\n" + prompt
+}
+
+func imageSize(aspectRatio string) string {
+	switch aspectRatio {
+	case "9:16", "3:4":
+		return "1024x1536"
+	case "1:1":
+		return "1024x1024"
+	default:
+		return "1536x1024"
+	}
 }
 
 type MockProvider struct{}
@@ -68,10 +167,6 @@ func (MockProvider) Poll(_ context.Context, id string) (ProviderResult, error) {
 	}
 }
 
-func (MockProvider) Retrieve(_ context.Context, _ string) (DownloadInfo, error) {
-	return DownloadInfo{}, errors.New("mock provider has no output file")
-}
-
 type MiniMaxProvider struct {
 	baseURL string
 	apiKey  string
@@ -82,7 +177,7 @@ type MiniMaxProvider struct {
 func NewMiniMaxProvider(baseURL, apiKey string, allowed bool) (*MiniMaxProvider, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {
-		baseURL = "https://api.minimax.io"
+		baseURL = "https://api.minimaxi.com"
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil || u.Host == "" || u.User != nil ||
@@ -93,7 +188,7 @@ func NewMiniMaxProvider(baseURL, apiKey string, allowed bool) (*MiniMaxProvider,
 		baseURL: baseURL,
 		apiKey:  strings.TrimSpace(apiKey),
 		allowed: allowed,
-		client:  &http.Client{Timeout: 30 * time.Second},
+		client:  &http.Client{Timeout: 60 * time.Second},
 	}, nil
 }
 
@@ -104,28 +199,28 @@ func (p *MiniMaxProvider) Submit(ctx context.Context, task Task) (string, error)
 	if p.apiKey == "" {
 		return "", errors.New("MINIMAX_API_KEY is not configured")
 	}
+	content := make([]map[string]any, 0, len(task.VideoInputs)+1)
+	content = append(content, map[string]any{"type": "text", "text": task.Prompt})
+	for _, input := range task.VideoInputs {
+		content = append(content, map[string]any{
+			"type": "image_url",
+			"image_url": map[string]string{
+				"url": "data:" + input.ContentType + ";base64," + base64.StdEncoding.EncodeToString(input.Data),
+			},
+			"role": input.Role,
+		})
+	}
 	payload := map[string]any{
-		"model":            task.Model,
-		"prompt":           task.Prompt,
-		"prompt_optimizer": true,
-	}
-	if task.FirstFrameImage != "" {
-		payload["first_frame_image"] = task.FirstFrameImage
-	}
-	if task.Duration != 0 {
-		payload["duration"] = task.Duration
-	}
-	if task.Resolution != "" {
-		payload["resolution"] = task.Resolution
+		"model":      task.Model,
+		"content":    content,
+		"resolution": task.Resolution,
+		"duration":   task.Duration,
+		"ratio":      task.AspectRatio,
 	}
 	var response struct {
-		TaskID   string   `json:"task_id"`
-		BaseResp baseResp `json:"base_resp"`
+		TaskID string `json:"task_id"`
 	}
-	if err := p.requestJSON(ctx, http.MethodPost, "/v1/video_generation", payload, &response); err != nil {
-		return "", err
-	}
-	if err := response.BaseResp.err(); err != nil {
+	if err := p.requestJSON(ctx, http.MethodPost, "/v2/video_generation", payload, &response); err != nil {
 		return "", err
 	}
 	if response.TaskID == "" {
@@ -139,78 +234,40 @@ func (p *MiniMaxProvider) Poll(ctx context.Context, taskID string) (ProviderResu
 		return ProviderResult{}, errors.New("MINIMAX_API_KEY is not configured")
 	}
 	var response struct {
-		Status   string   `json:"status"`
-		FileID   string   `json:"file_id"`
-		BaseResp baseResp `json:"base_resp"`
+		Task struct {
+			Status  string `json:"status"`
+			Content struct {
+				URL string `json:"url"`
+			} `json:"content"`
+			Error string `json:"error"`
+		} `json:"task"`
 	}
-	path := "/v1/query/video_generation?task_id=" + url.QueryEscape(taskID)
+	path := "/v2/query/video_generation/" + url.PathEscape(taskID)
 	if err := p.requestJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
 		return ProviderResult{}, err
 	}
-	if err := response.BaseResp.err(); err != nil {
-		return ProviderResult{}, err
-	}
-	status := strings.ToLower(response.Status)
-	switch status {
-	case "preparing":
-		return ProviderResult{Status: ProviderPreparing}, nil
-	case "queueing":
+	switch strings.ToLower(response.Task.Status) {
+	case "queued":
 		return ProviderResult{Status: ProviderQueueing}, nil
-	case "processing":
+	case "running":
 		return ProviderResult{Status: ProviderProcessing}, nil
-	case "success":
-		return ProviderResult{Status: ProviderSuccess, FileID: response.FileID}, nil
-	case "fail", "failed":
+	case "succeeded":
+		u, err := url.Parse(response.Task.Content.URL)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+			return ProviderResult{}, errors.New("MiniMax response contains invalid output URL")
+		}
+		return ProviderResult{Status: ProviderSuccess, DownloadURL: response.Task.Content.URL}, nil
+	case "failed", "cancelled":
 		return ProviderResult{Status: ProviderFailed}, nil
 	default:
-		return ProviderResult{}, fmt.Errorf("unknown MiniMax task status %q", response.Status)
+		return ProviderResult{}, fmt.Errorf("unknown MiniMax task status %q", response.Task.Status)
 	}
-}
-
-func (p *MiniMaxProvider) Retrieve(ctx context.Context, fileID string) (DownloadInfo, error) {
-	if p.apiKey == "" {
-		return DownloadInfo{}, errors.New("MINIMAX_API_KEY is not configured")
-	}
-	var response struct {
-		File struct {
-			Filename    string `json:"filename"`
-			Bytes       int64  `json:"bytes"`
-			DownloadURL string `json:"download_url"`
-		} `json:"file"`
-		BaseResp baseResp `json:"base_resp"`
-	}
-	path := "/v1/files/retrieve?file_id=" + url.QueryEscape(fileID)
-	if err := p.requestJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
-		return DownloadInfo{}, err
-	}
-	if err := response.BaseResp.err(); err != nil {
-		return DownloadInfo{}, err
-	}
-	u, err := url.Parse(response.File.DownloadURL)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
-		return DownloadInfo{}, errors.New("MiniMax response contains invalid download URL")
-	}
-	return DownloadInfo{
-		URL:      response.File.DownloadURL,
-		Filename: response.File.Filename,
-		Size:     response.File.Bytes,
-	}, nil
 }
 
 func isLoopbackHost(host string) bool {
-	return strings.EqualFold(host, "localhost") || net.ParseIP(host).IsLoopback()
-}
-
-type baseResp struct {
-	StatusCode int    `json:"status_code"`
-	StatusMsg  string `json:"status_msg"`
-}
-
-func (r baseResp) err() error {
-	if r.StatusCode == 0 {
-		return nil
-	}
-	return fmt.Errorf("MiniMax API error %d: %s", r.StatusCode, r.StatusMsg)
+	return strings.EqualFold(host, "localhost") ||
+		strings.EqualFold(host, "host.docker.internal") ||
+		net.ParseIP(host).IsLoopback()
 }
 
 func (p *MiniMaxProvider) requestJSON(ctx context.Context, method, path string, body any, target any) error {
