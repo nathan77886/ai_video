@@ -1334,6 +1334,14 @@ func (s *HTTPServer) deleteVideo(w http.ResponseWriter, r *http.Request) {
 						state.Shots[i].UpdatedAt = time.Now().UTC()
 					}
 				}
+				for i := range state.Tasks {
+					task := &state.Tasks[i]
+					if task.VideoID == id {
+						task.VideoID = ""
+						task.UpdatedAt = time.Now().UTC()
+						appendTaskLog(task, "关联试片已删除")
+					}
+				}
 				return nil
 			}
 		}

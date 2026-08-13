@@ -42,7 +42,36 @@ func OpenStore(dataDir string) (*Store, error) {
 	if err := json.Unmarshal(data, &s.state); err != nil {
 		return nil, fmt.Errorf("decode state: %w", err)
 	}
+	if repairDanglingVideoReferences(&s.state) {
+		if err := s.write(s.state); err != nil {
+			return nil, fmt.Errorf("persist repaired state: %w", err)
+		}
+	}
 	return s, nil
+}
+
+func repairDanglingVideoReferences(state *State) bool {
+	repaired := false
+	videoIDs := make(map[string]bool, len(state.Videos))
+	for _, video := range state.Videos {
+		videoIDs[video.ID] = true
+	}
+	for i := range state.Shots {
+		shot := &state.Shots[i]
+		if shot.VideoID != "" && !videoIDs[shot.VideoID] {
+			shot.VideoID = ""
+			repaired = true
+		}
+	}
+	for i := range state.Tasks {
+		task := &state.Tasks[i]
+		if task.VideoID != "" && !videoIDs[task.VideoID] {
+			task.VideoID = ""
+			appendTaskLog(task, "本地试片不存在，已清理悬空关联")
+			repaired = true
+		}
+	}
+	return repaired
 }
 
 func newID(prefix string) (string, error) {

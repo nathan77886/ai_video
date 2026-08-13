@@ -894,6 +894,45 @@ func TestReviewVideoRejectsInvalidStatus(t *testing.T) {
 	}
 }
 
+func TestDeleteVideoClearsShotAndTaskReferences(t *testing.T) {
+	t.Parallel()
+	store, _, handler := newShotTestServer(t)
+	now := time.Now().UTC()
+	if err := store.Update(func(state *State) error {
+		state.Videos = append(state.Videos, Video{
+			ID: "vid_test", ProjectID: "prj_test", Filename: "test.mp4",
+			StoragePath: "prj_test/videos/vid_test/test.mp4", CreatedAt: now,
+		})
+		state.Shots = append(state.Shots, Shot{
+			ID: "E001-S001-SH001", ProjectID: "prj_test", VideoID: "vid_test",
+		})
+		state.Tasks = append(state.Tasks, Task{
+			ID: "tsk_test", ProjectID: "prj_test", VideoID: "vid_test",
+			Status: TaskSucceeded, UpdatedAt: now,
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodDelete, "/api/videos/vid_test", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if err := store.View(func(state State) error {
+		if len(state.Videos) != 0 || state.Shots[0].VideoID != "" || state.Tasks[0].VideoID != "" {
+			t.Fatalf("dangling references remain: %+v", state)
+		}
+		if !strings.Contains(strings.Join(state.Tasks[0].Logs, "\n"), "关联试片已删除") {
+			t.Fatalf("task log missing deletion: %+v", state.Tasks[0].Logs)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newShotTestServer(t *testing.T) (*Store, *Worker, http.Handler) {
 	t.Helper()
 	store, err := OpenStore(t.TempDir())
