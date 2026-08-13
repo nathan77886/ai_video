@@ -95,15 +95,16 @@ func TestGenerateShotImagesQueuesMissingImages(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
+	firstShot := Shot{ID: "E001-S001-SH001", ProjectID: "prj_test", AspectRatio: "16:9", Visual: "first", Prompt: "first prompt"}
 	if err := store.Update(func(state *State) error {
 		state.Projects = append(state.Projects, Project{ID: "prj_test", Name: "test", CreatedAt: now, UpdatedAt: now})
 		state.Shots = append(state.Shots,
-			Shot{ID: "E001-S001-SH001", ProjectID: "prj_test", AspectRatio: "16:9", Visual: "first", Prompt: "first prompt"},
+			firstShot,
 			Shot{ID: "E001-S001-SH002", ProjectID: "prj_test", AspectRatio: "9:16", Visual: "second", Prompt: "second prompt"},
 		)
 		state.Tasks = append(state.Tasks, Task{
 			ID: "tsk_existing", ProjectID: "prj_test", ShotID: "E001-S001-SH001", Kind: "image_generation",
-			Provider: "openai", Model: "gpt-image-2", ImageRole: "preview", Status: TaskSucceeded, CreatedAt: now, UpdatedAt: now,
+			Provider: "openai", Model: "gpt-image-2", Prompt: imagePrompt(firstShot, "preview"), ImageRole: "preview", Status: TaskSucceeded, CreatedAt: now, UpdatedAt: now,
 		})
 		return nil
 	}); err != nil {
@@ -130,6 +131,54 @@ func TestGenerateShotImagesQueuesMissingImages(t *testing.T) {
 	if result.Queued != 5 || result.Skipped != 1 {
 		t.Fatalf("result = %+v, want 5 queued and 1 skipped", result)
 	}
+}
+
+func TestGenerateShotImagesRegeneratesAfterPromptChange(t *testing.T) {
+	t.Parallel()
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	oldShot := Shot{ID: "E001-S001-SH001", ProjectID: "prj_test", AspectRatio: "16:9", Visual: "old visual", Prompt: "old prompt"}
+	newShot := oldShot
+	newShot.Visual = "new visual"
+	newShot.Prompt = "new prompt"
+	if err := store.Update(func(state *State) error {
+		state.Projects = append(state.Projects, Project{ID: "prj_test", Name: "test", CreatedAt: now, UpdatedAt: now})
+		state.Shots = append(state.Shots, newShot)
+		for _, role := range []string{"first-frame", "last-frame", "preview"} {
+			state.Tasks = append(state.Tasks, Task{
+				ID: "tsk_old_" + role, ProjectID: "prj_test", ShotID: oldShot.ID, Kind: "image_generation",
+				Provider: "openai", Model: "gpt-image-2", Prompt: imagePrompt(oldShot, role), ImageRole: role,
+				Status: TaskSucceeded, CreatedAt: now, UpdatedAt: now,
+			})
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tasks, skipped, err := newShotImageTasks(&State{Tasks: mustTasks(t, store)}, newShot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 3 || skipped != 0 {
+		t.Fatalf("tasks = %d, skipped = %d, want 3 and 0", len(tasks), skipped)
+	}
+	for _, task := range tasks {
+		if task.Prompt != imagePrompt(newShot, task.ImageRole) {
+			t.Fatalf("stale prompt queued for %s", task.ImageRole)
+		}
+	}
+}
+
+func mustTasks(t *testing.T, store *Store) []Task {
+	t.Helper()
+	var tasks []Task
+	if err := store.View(func(state State) error { tasks = state.Tasks; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	return tasks
 }
 
 func TestGenerateCharacterImagesQueuesMissingImages(t *testing.T) {

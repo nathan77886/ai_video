@@ -957,7 +957,8 @@ func newShotImageTasks(state *State, shot Shot) ([]Task, int, error) {
 	tasks := make([]Task, 0, 3)
 	skipped := 0
 	for _, role := range []string{"first-frame", "last-frame", "preview"} {
-		if hasShotImageTask(*state, shot.ID, role) {
+		prompt := imagePrompt(shot, role)
+		if hasShotImageTask(*state, shot.ID, role, prompt) {
 			skipped++
 			continue
 		}
@@ -968,7 +969,7 @@ func newShotImageTasks(state *State, shot Shot) ([]Task, int, error) {
 		now := time.Now().UTC()
 		task := Task{
 			ID: id, ProjectID: shot.ProjectID, ShotID: shot.ID, Kind: "image_generation",
-			Provider: "openai", Model: "gpt-image-2", Prompt: imagePrompt(shot, role), ImageRole: role,
+			Provider: "openai", Model: "gpt-image-2", Prompt: prompt, ImageRole: role,
 			AspectRatio: shot.AspectRatio, Status: TaskQueued, MaxAttempts: 2, CreatedAt: now, UpdatedAt: now,
 		}
 		appendTaskLog(&task, "创建 "+imageRoleName(role))
@@ -1039,9 +1040,10 @@ func characterImagePrompt(character Asset, model, role string) string {
 		"\n\nKeep exact identity, age, body scale, face, hair, eye color, costume, equipment, and timeline restrictions. Plain restrained background. No text, labels, logos, watermarks, collage, split panels, duplicate character, injury, blood, or gore."
 }
 
-func hasShotImageTask(state State, shotID, role string) bool {
+func hasShotImageTask(state State, shotID, role, prompt string) bool {
 	for _, task := range state.Tasks {
 		if task.ShotID == shotID && task.Kind == "image_generation" && task.ImageRole == role &&
+			task.Prompt == prompt &&
 			(task.Status == TaskQueued || task.Status == TaskRunning || task.Status == TaskSucceeded) {
 			return true
 		}
