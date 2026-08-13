@@ -77,6 +77,7 @@ func NewHTTPServer(
 	mux.HandleFunc("DELETE /api/assets/{id}", s.deleteAsset)
 	mux.HandleFunc("GET /api/videos", s.listVideos)
 	mux.HandleFunc("POST /api/videos", s.uploadVideo)
+	mux.HandleFunc("PATCH /api/videos/{id}/review", s.reviewVideo)
 	mux.HandleFunc("GET /api/videos/{id}/content", s.videoContent)
 	mux.HandleFunc("DELETE /api/videos/{id}", s.deleteVideo)
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
@@ -374,8 +375,9 @@ func (s *HTTPServer) listShots(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTPServer) importShots(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		ProjectID string `json:"project_id"`
-		Shots     []Shot `json:"shots"`
+		ProjectID       string `json:"project_id"`
+		ReplaceExisting bool   `json:"replace_existing"`
+		Shots           []Shot `json:"shots"`
 	}
 	if err := decodeJSON(w, r, &input); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -414,19 +416,31 @@ func (s *HTTPServer) importShots(w http.ResponseWriter, r *http.Request) {
 		}
 		seen[shot.ID] = true
 	}
-	var imported, skipped int
+	var imported, updated, skipped int
 	err := s.store.Update(func(state *State) error {
 		if _, err := findProject(state, input.ProjectID); err != nil {
 			return err
 		}
-		existing := make(map[string]bool, len(state.Shots))
-		for _, shot := range state.Shots {
-			existing[shot.ID] = true
+		existing := make(map[string]int, len(state.Shots))
+		for i, shot := range state.Shots {
+			existing[shot.ID] = i
 		}
 		now := time.Now().UTC()
 		for _, shot := range input.Shots {
-			if existing[shot.ID] {
-				skipped++
+			if index, ok := existing[shot.ID]; ok {
+				if !input.ReplaceExisting {
+					skipped++
+					continue
+				}
+				current := state.Shots[index]
+				shot.ReviewStatus = ShotPending
+				shot.ReviewNote = ""
+				shot.TaskID = current.TaskID
+				shot.VideoID = current.VideoID
+				shot.CreatedAt = current.CreatedAt
+				shot.UpdatedAt = now
+				state.Shots[index] = shot
+				updated++
 				continue
 			}
 			shot.ReviewStatus = ShotPending
@@ -444,7 +458,7 @@ func (s *HTTPServer) importShots(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			state.Shots = append(state.Shots, shot)
-			existing[shot.ID] = true
+			existing[shot.ID] = len(state.Shots) - 1
 			imported++
 		}
 		return nil
@@ -453,7 +467,7 @@ func (s *HTTPServer) importShots(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]int{"imported": imported, "skipped": skipped})
+	writeJSON(w, http.StatusCreated, map[string]int{"imported": imported, "updated": updated, "skipped": skipped})
 }
 
 func validateImportedShot(shot Shot) error {
@@ -514,11 +528,11 @@ func (s *HTTPServer) reviewShot(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTPServer) generateShot(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Provider              string `json:"provider"`
-		Resolution            string `json:"resolution"`
-		UseFrameImages        bool   `json:"use_frame_images"`
-		CharacterPromptCount  int    `json:"character_prompt_count"`
-		ReferenceImageIDs     []string `json:"reference_image_ids"`
+		Provider             string   `json:"provider"`
+		Resolution           string   `json:"resolution"`
+		UseFrameImages       bool     `json:"use_frame_images"`
+		CharacterPromptCount int      `json:"character_prompt_count"`
+		ReferenceImageIDs    []string `json:"reference_image_ids"`
 	}
 	if err := decodeJSON(w, r, &input); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -596,6 +610,7 @@ func (s *HTTPServer) generateShot(w http.ResponseWriter, r *http.Request) {
 			Status: TaskQueued, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now,
 			UseFrameImages: input.UseFrameImages, CharacterPromptCount: input.CharacterPromptCount,
 			ReferenceImageIDs: slices.Clone(input.ReferenceImageIDs),
+			InputVersion:      shot.InputVersion,
 		}
 		appendTaskLog(&task, "镜头 "+shot.ID+" 生成任务已创建")
 		state.Tasks = append(state.Tasks, task)
@@ -624,17 +639,20 @@ func (s *HTTPServer) generateShot(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTPServer) generateShotSequence(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		ProjectID            string   `json:"project_id"`
-		ShotIDs              []string `json:"shot_ids"`
-		Provider             string   `json:"provider"`
-		Resolution           string   `json:"resolution"`
-		CharacterPromptCount int      `json:"character_prompt_count"`
+		ProjectID            string            `json:"project_id"`
+		ShotIDs              []string          `json:"shot_ids"`
+		PreviousTaskID       string            `json:"previous_task_id"`
+		PromptOverrides      map[string]string `json:"prompt_overrides"`
+		Provider             string            `json:"provider"`
+		Resolution           string            `json:"resolution"`
+		CharacterPromptCount int               `json:"character_prompt_count"`
 	}
 	if err := decodeJSON(w, r, &input); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	input.ProjectID = strings.TrimSpace(input.ProjectID)
+	input.PreviousTaskID = strings.TrimSpace(input.PreviousTaskID)
 	input.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
 	if input.Resolution == "" {
 		input.Resolution = "768P"
@@ -661,12 +679,25 @@ func (s *HTTPServer) generateShotSequence(w http.ResponseWriter, r *http.Request
 		seen[id] = true
 		input.ShotIDs[i] = id
 	}
+	for shotID, prompt := range input.PromptOverrides {
+		if !seen[shotID] || strings.TrimSpace(prompt) == "" || len([]rune(prompt)) > 7000 {
+			writeError(w, http.StatusBadRequest, "prompt_overrides must target selected shots with 1-7000 characters")
+			return
+		}
+		input.PromptOverrides[shotID] = strings.TrimSpace(prompt)
+	}
 	tasks := []Task{}
 	err := s.store.Update(func(state *State) error {
 		if _, err := findProject(state, input.ProjectID); err != nil {
 			return err
 		}
-		previousTaskID := ""
+		previousTaskID := input.PreviousTaskID
+		if previousTaskID != "" {
+			previous, err := findTask(state, previousTaskID)
+			if err != nil || previous.ProjectID != input.ProjectID || previous.Status != TaskSucceeded || previous.VideoID == "" {
+				return errors.New("previous_task_id must be a succeeded project video task")
+			}
+		}
 		for _, shotID := range input.ShotIDs {
 			shot, err := findShot(state, shotID)
 			if err != nil {
@@ -688,12 +719,17 @@ func (s *HTTPServer) generateShotSequence(w http.ResponseWriter, r *http.Request
 				return err
 			}
 			now := time.Now().UTC()
+			prompt := shot.Prompt
+			if override, ok := input.PromptOverrides[shot.ID]; ok {
+				prompt = override
+			}
 			task := Task{
 				ID: id, ProjectID: shot.ProjectID, ShotID: shot.ID, Kind: "video_generation",
-				Provider: input.Provider, Model: shot.TargetModel, Prompt: shot.Prompt,
+				Provider: input.Provider, Model: shot.TargetModel, Prompt: prompt,
 				Duration: shot.Duration, Resolution: input.Resolution, AspectRatio: shot.AspectRatio,
 				Status: TaskQueued, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now,
 				CharacterPromptCount: input.CharacterPromptCount, PreviousTaskID: previousTaskID,
+				InputVersion: shot.InputVersion,
 			}
 			appendTaskLog(&task, "顺序试片任务已创建")
 			state.Tasks = append(state.Tasks, task)
@@ -1220,6 +1256,47 @@ func (s *HTTPServer) listVideos(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, videos)
 }
 
+func (s *HTTPServer) reviewVideo(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Status VideoReviewStatus `json:"status"`
+		Note   string            `json:"note"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !slices.Contains([]VideoReviewStatus{VideoUnreviewed, VideoUsable, VideoRejected}, input.Status) {
+		writeError(w, http.StatusBadRequest, "invalid video review status")
+		return
+	}
+	input.Note = strings.TrimSpace(input.Note)
+	if len([]rune(input.Note)) > 1000 {
+		writeError(w, http.StatusBadRequest, "note exceeds 1000 characters")
+		return
+	}
+	var updated Video
+	err := s.store.Update(func(state *State) error {
+		for i := range state.Videos {
+			video := &state.Videos[i]
+			if video.ID != r.PathValue("id") {
+				continue
+			}
+			now := time.Now().UTC()
+			video.ReviewStatus = input.Status
+			video.ReviewNote = input.Note
+			video.ReviewUpdatedAt = &now
+			updated = *video
+			return nil
+		}
+		return ErrNotFound
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
 func (s *HTTPServer) uploadVideo(w http.ResponseWriter, r *http.Request) {
 	s.upload(w, r, true)
 }
@@ -1324,7 +1401,8 @@ func (s *HTTPServer) upload(w http.ResponseWriter, r *http.Request, video bool) 
 	if video {
 		item := Video{
 			ID: id, ProjectID: projectID, Title: name, Filename: filename,
-			ContentType: contentType, Size: size, StoragePath: relPath, Provider: "upload", CreatedAt: now,
+			ContentType: contentType, Size: size, StoragePath: relPath, Provider: "upload",
+			ReviewStatus: VideoUnreviewed, CreatedAt: now,
 		}
 		if err := s.store.Update(func(state *State) error {
 			for i := range state.Shots {

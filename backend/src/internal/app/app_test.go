@@ -464,7 +464,7 @@ func TestGenerateShotSequenceQueuesOnlyFirstTask(t *testing.T) {
 			state.Shots = append(state.Shots, Shot{
 				ID: id, ProjectID: "prj_test", EpisodeID: "E001", SceneID: "E001-S001", Chapter: 1,
 				ChapterTitle: "chapter", Visual: "visual", Duration: 6, AspectRatio: "16:9", TargetModel: "MiniMax-H3",
-				GenerationRoute: "video_api", Prompt: "prompt", ReviewStatus: ShotApproved,
+				GenerationRoute: "video_api", Prompt: "prompt", InputVersion: "v009/v007", ReviewStatus: ShotApproved,
 			})
 		}
 		return nil
@@ -479,8 +479,46 @@ func TestGenerateShotSequenceQueuesOnlyFirstTask(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
 	if err := store.View(func(state State) error {
-		if len(state.Tasks) != 2 || state.Tasks[0].PreviousTaskID != "" || state.Tasks[1].PreviousTaskID != state.Tasks[0].ID || state.Tasks[1].CharacterPromptCount != 1 {
+		if len(state.Tasks) != 2 || state.Tasks[0].PreviousTaskID != "" || state.Tasks[1].PreviousTaskID != state.Tasks[0].ID || state.Tasks[1].CharacterPromptCount != 1 || state.Tasks[0].InputVersion != "v009/v007" || state.Tasks[1].InputVersion != "v009/v007" {
 			t.Fatalf("unexpected sequence tasks: %+v", state.Tasks)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGenerateShotSequenceAcceptsSucceededPreviousVideoAndPromptOverride(t *testing.T) {
+	t.Parallel()
+	store, worker, _ := newShotTestServer(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := NewHTTPServer(store, worker, logger, 1<<20, true, true, false)
+	now := time.Now().UTC()
+	if err := store.Update(func(state *State) error {
+		state.Projects = append(state.Projects, Project{ID: "prj_test", Name: "test", CreatedAt: now, UpdatedAt: now})
+		for _, shot := range []Shot{
+			{ID: "E001-S001-SH001", ProjectID: "prj_test", EpisodeID: "E001", SceneID: "E001-S001", Chapter: 1, ChapterTitle: "chapter", Visual: "visual", Duration: 6, AspectRatio: "16:9", TargetModel: "MiniMax-H3", GenerationRoute: "video_api", Prompt: "original", ReviewStatus: ShotApproved},
+			{ID: "E001-S001-SH002", ProjectID: "prj_test", EpisodeID: "E001", SceneID: "E001-S001", Chapter: 1, ChapterTitle: "chapter", Visual: "visual", Duration: 6, AspectRatio: "16:9", TargetModel: "MiniMax-H3", GenerationRoute: "video_api", Prompt: "second", ReviewStatus: ShotApproved},
+		} {
+			state.Shots = append(state.Shots, shot)
+		}
+		state.Tasks = append(state.Tasks, Task{ID: "tsk_previous", ProjectID: "prj_test", ShotID: "E001-S000-SH001", Status: TaskSucceeded, VideoID: "vid_previous"})
+		state.Videos = append(state.Videos, Video{ID: "vid_previous", ProjectID: "prj_test", TaskID: "tsk_previous"})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/shots/generate-sequence", bytes.NewBufferString(`{"project_id":"prj_test","shot_ids":["E001-S001-SH001","E001-S001-SH002"],"previous_task_id":"tsk_previous","prompt_overrides":{"E001-S001-SH001":"revised prompt"},"provider":"minimax"}`))
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if err := store.View(func(state State) error {
+		created := state.Tasks[len(state.Tasks)-2:]
+		if created[0].PreviousTaskID != "tsk_previous" || created[0].Prompt != "revised prompt" || created[1].PreviousTaskID != created[0].ID {
+			t.Fatalf("unexpected tasks: %+v", created)
 		}
 		return nil
 	}); err != nil {
@@ -726,6 +764,49 @@ func TestShotImportSkipsExistingReview(t *testing.T) {
 	}
 }
 
+func TestShotImportReplacesExistingContentForReview(t *testing.T) {
+	t.Parallel()
+	store, _, handler := newShotTestServer(t)
+	now := time.Now().UTC()
+	if err := store.Update(func(state *State) error {
+		state.Projects = append(state.Projects, Project{ID: "prj_test", Name: "test", CreatedAt: now, UpdatedAt: now})
+		state.Shots = append(state.Shots, Shot{
+			ID: "E001-S001-SH001", ProjectID: "prj_test", EpisodeID: "E001", SceneID: "E001-S001",
+			Chapter: 1, ChapterTitle: "old", Visual: "old", Duration: 6, AspectRatio: "16:9",
+			TargetModel: "MiniMax-H3", GenerationRoute: "video_api", Prompt: "old",
+			ReviewStatus: ShotApproved, ReviewNote: "keep", TaskID: "tsk_old", VideoID: "vid_old",
+			CreatedAt: now, UpdatedAt: now,
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"project_id":"prj_test","replace_existing":true,"shots":[{"id":"E001-S001-SH001","episode_id":"E001","scene_id":"E001-S001","chapter":1,"chapter_title":"new","visual":"new","duration_sec":5,"aspect_ratio":"16:9","target_model":"MiniMax-H3","generation_route":"video_api","prompt":"new","negative_prompt":"negative","input_version":"v009/v007"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/shots/import", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var result map[string]int
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result["updated"] != 1 || result["imported"] != 0 || result["skipped"] != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if err := store.View(func(state State) error {
+		shot := state.Shots[0]
+		if len(state.Shots) != 1 || shot.ReviewStatus != ShotPending || shot.ReviewNote != "" || shot.Prompt != "new" || shot.NegativePrompt != "negative" || shot.Duration != 5 || shot.InputVersion != "v009/v007" || shot.TaskID != "tsk_old" || shot.VideoID != "vid_old" || !shot.CreatedAt.Equal(now) {
+			t.Fatalf("unexpected replacement: %+v", shot)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestListVideosSortsByShotID(t *testing.T) {
 	t.Parallel()
 	store, _, handler := newShotTestServer(t)
@@ -759,6 +840,57 @@ func TestListVideosSortsByShotID(t *testing.T) {
 		if videos[i].ID != id {
 			t.Fatalf("videos[%d] = %q, want %q", i, videos[i].ID, id)
 		}
+	}
+}
+
+func TestReviewVideo(t *testing.T) {
+	t.Parallel()
+	store, _, handler := newShotTestServer(t)
+	now := time.Now().UTC()
+	if err := store.Update(func(state *State) error {
+		state.Videos = append(state.Videos, Video{
+			ID: "vid_test", ProjectID: "prj_test", Filename: "test.mp4",
+			ReviewStatus: VideoUnreviewed, CreatedAt: now,
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/api/videos/vid_test/review",
+		bytes.NewBufferString(`{"status":"usable","note":"keep this take"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if err := store.View(func(state State) error {
+		video := state.Videos[0]
+		if video.ReviewStatus != VideoUsable || video.ReviewNote != "keep this take" || video.ReviewUpdatedAt == nil {
+			t.Fatalf("unexpected review: %+v", video)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReviewVideoRejectsInvalidStatus(t *testing.T) {
+	t.Parallel()
+	_, _, handler := newShotTestServer(t)
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/api/videos/vid_test/review",
+		bytes.NewBufferString(`{"status":"approved"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body = %s", response.Code, http.StatusBadRequest, response.Body.String())
 	}
 }
 

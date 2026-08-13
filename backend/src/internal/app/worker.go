@@ -915,7 +915,8 @@ func (w *Worker) completeVideo(ctx context.Context, taskID, downloadURL string) 
 			ID: videoID, ProjectID: task.ProjectID, TaskID: taskID, ShotID: task.ShotID,
 			Title: task.Prompt, Filename: filename, ContentType: contentType,
 			Size: written, StoragePath: filepath.ToSlash(relPath),
-			Provider: task.Provider, Model: task.Model, CreatedAt: now,
+			Provider: task.Provider, Model: task.Model, InputVersion: task.InputVersion,
+			ReviewStatus: VideoUnreviewed, CreatedAt: now,
 		})
 		storedTask.Status = TaskSucceeded
 		storedTask.Progress = 100

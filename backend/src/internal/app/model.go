@@ -89,19 +89,31 @@ type ShotWithAssets struct {
 }
 
 type Video struct {
-	ID          string    `json:"id"`
-	ProjectID   string    `json:"project_id"`
-	TaskID      string    `json:"task_id,omitempty"`
-	ShotID      string    `json:"shot_id,omitempty"`
-	Title       string    `json:"title"`
-	Filename    string    `json:"filename"`
-	ContentType string    `json:"content_type"`
-	Size        int64     `json:"size"`
-	StoragePath string    `json:"storage_path"`
-	Provider    string    `json:"provider,omitempty"`
-	Model       string    `json:"model,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID              string            `json:"id"`
+	ProjectID       string            `json:"project_id"`
+	TaskID          string            `json:"task_id,omitempty"`
+	ShotID          string            `json:"shot_id,omitempty"`
+	InputVersion    string            `json:"input_version,omitempty"`
+	ReviewStatus    VideoReviewStatus `json:"review_status,omitempty"`
+	ReviewNote      string            `json:"review_note,omitempty"`
+	Title           string            `json:"title"`
+	Filename        string            `json:"filename"`
+	ContentType     string            `json:"content_type"`
+	Size            int64             `json:"size"`
+	StoragePath     string            `json:"storage_path"`
+	Provider        string            `json:"provider,omitempty"`
+	Model           string            `json:"model,omitempty"`
+	CreatedAt       time.Time         `json:"created_at"`
+	ReviewUpdatedAt *time.Time        `json:"review_updated_at,omitempty"`
 }
+
+type VideoReviewStatus string
+
+const (
+	VideoUnreviewed VideoReviewStatus = "unreviewed"
+	VideoUsable     VideoReviewStatus = "usable"
+	VideoRejected   VideoReviewStatus = "rejected"
+)
 
 type TaskStatus string
 
@@ -114,34 +126,35 @@ const (
 )
 
 type Task struct {
-	ID                string     `json:"id"`
-	ProjectID         string     `json:"project_id"`
-	ShotID            string     `json:"shot_id,omitempty"`
-	AssetID           string     `json:"asset_id,omitempty"`
-	Kind              string     `json:"kind"`
-	Provider          string     `json:"provider"`
-	Model             string     `json:"model"`
-	Prompt            string     `json:"prompt"`
-	ImageRole         string     `json:"image_role,omitempty"`
-	Duration          int        `json:"duration,omitempty"`
-	Resolution        string     `json:"resolution,omitempty"`
-	AspectRatio       string     `json:"aspect_ratio,omitempty"`
-	Status            TaskStatus `json:"status"`
-	Progress          int        `json:"progress"`
-	ProviderTaskID    string     `json:"provider_task_id,omitempty"`
-	ProviderOutputURL string     `json:"provider_output_url,omitempty"`
-	VideoID           string     `json:"video_id,omitempty"`
-	Attempts          int        `json:"attempts"`
-	MaxAttempts       int        `json:"max_attempts"`
-	Error             string     `json:"error,omitempty"`
-	Logs              []string   `json:"logs,omitempty"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
-	CompletedAt       *time.Time `json:"completed_at,omitempty"`
+	ID                   string       `json:"id"`
+	ProjectID            string       `json:"project_id"`
+	ShotID               string       `json:"shot_id,omitempty"`
+	AssetID              string       `json:"asset_id,omitempty"`
+	Kind                 string       `json:"kind"`
+	Provider             string       `json:"provider"`
+	Model                string       `json:"model"`
+	Prompt               string       `json:"prompt"`
+	ImageRole            string       `json:"image_role,omitempty"`
+	Duration             int          `json:"duration,omitempty"`
+	Resolution           string       `json:"resolution,omitempty"`
+	AspectRatio          string       `json:"aspect_ratio,omitempty"`
+	Status               TaskStatus   `json:"status"`
+	Progress             int          `json:"progress"`
+	ProviderTaskID       string       `json:"provider_task_id,omitempty"`
+	ProviderOutputURL    string       `json:"provider_output_url,omitempty"`
+	VideoID              string       `json:"video_id,omitempty"`
+	Attempts             int          `json:"attempts"`
+	MaxAttempts          int          `json:"max_attempts"`
+	Error                string       `json:"error,omitempty"`
+	Logs                 []string     `json:"logs,omitempty"`
+	CreatedAt            time.Time    `json:"created_at"`
+	UpdatedAt            time.Time    `json:"updated_at"`
+	CompletedAt          *time.Time   `json:"completed_at,omitempty"`
 	UseFrameImages       bool         `json:"use_frame_images,omitempty"`
 	CharacterPromptCount int          `json:"character_prompt_count,omitempty"`
 	ReferenceImageIDs    []string     `json:"reference_image_ids,omitempty"`
 	PreviousTaskID       string       `json:"previous_task_id,omitempty"`
+	InputVersion         string       `json:"input_version,omitempty"`
 	VideoInputs          []VideoInput `json:"-"`
 }
 

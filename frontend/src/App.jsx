@@ -24,6 +24,12 @@ const taskLabels = {
 
 const taskStatusOrder = { running: 0, queued: 1, failed: 2, cancelled: 3 }
 
+const videoReviewLabels = {
+  unreviewed: '未审核',
+  usable: '可用',
+  rejected: '不采用',
+}
+
 const kindLabels = {
   character: '角色', scene: '场景', prop: '道具', costume: '服装',
   image: '图片', audio: '音频', document: '文档', other: '其他',
@@ -118,7 +124,6 @@ export default function App() {
   const visibleAssetIDs = useMemo(() => new Set(assets.map((asset) => asset.id)), [assets])
   const visibleTasks = useMemo(() => tasks.filter((task) => visibleShotIDs.has(task.shot_id) || visibleAssetIDs.has(task.asset_id)), [tasks, visibleShotIDs, visibleAssetIDs])
   const actionableTasks = useMemo(() => visibleTasks.filter((task) => task.status !== 'succeeded').sort((a, b) => (taskStatusOrder[a.status] ?? 99) - (taskStatusOrder[b.status] ?? 99) || new Date(b.updated_at) - new Date(a.updated_at)), [visibleTasks])
-  const visibleVideos = useMemo(() => videos.filter((video) => visibleShotIDs.has(video.shot_id)), [videos, visibleShotIDs])
   const visibleAssets = useMemo(() => assets.filter((asset) => !asset.links?.length || asset.links.some((link) => link.target_type !== 'shot' || visibleShotIDs.has(link.target_id))), [assets, visibleShotIDs])
 
   const run = useCallback(async (action) => {
@@ -188,7 +193,7 @@ export default function App() {
     await run(async () => { await api(`/api/projects/${selectedProject.id}`, { method: 'DELETE' }); await loadProjects() }).catch(() => {})
   }
 
-  const counts = { shots: visibleShots.length, assets: visibleAssets.length, videos: visibleVideos.length, tasks: actionableTasks.length }
+  const counts = { shots: visibleShots.length, assets: visibleAssets.length, videos: videos.length, tasks: actionableTasks.length }
   const reload = () => loadProjectData(projectID)
 
   return (
@@ -196,7 +201,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand"><span className="brand-mark">30K</span><div><strong>镜头生产台</strong><small>Warhammer × Azeroth</small></div></div>
         <label className="field dark-field"><span>当前项目</span><select value={projectID} onChange={(event) => setProjectID(event.target.value)}><option value="">选择项目</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
-        {versions.length > 0 && <label className="field dark-field"><span>资源版本</span><select value={selectedVersion} onChange={(event) => setInputVersion(event.target.value)}>{versions.map((version) => <option key={version} value={version}>{version}</option>)}</select></label>}
+        {versions.length > 0 && <label className="field dark-field"><span>分镜版本</span><select value={selectedVersion} onChange={(event) => setInputVersion(event.target.value)}>{versions.map((version) => <option key={version} value={version}>{version}</option>)}</select></label>}
         <details className="project-create"><summary>+ 新建项目</summary><form onSubmit={createProject} className="stack-form"><label className="field dark-field"><span>项目名</span><input name="name" required maxLength="100" /></label><label className="field dark-field"><span>说明</span><textarea name="description" maxLength="1000" /></label><button className="primary" disabled={busy}>创建</button></form></details>
         <nav aria-label="工作区">{tabs.map(([id, label]) => <button key={id} className={tab === id ? 'nav-active' : ''} onClick={() => setTab(id)}><span className={`nav-dot dot-${id}`} />{label}<span className="nav-count">{counts[id]}</span></button>)}</nav>
         <div className="provider-state"><span className={config?.openai_image_configured ? 'online' : 'offline'} />GPT Image 2 {config?.openai_image_configured ? '图片队列已启用' : '未配置'}</div>
@@ -207,9 +212,9 @@ export default function App() {
         {error && <div className="alert" role="alert"><span>{error}</span><button onClick={() => setError('')}>关闭</button></div>}
         {!projects.length ? <EmptyProject onSubmit={createProject} busy={busy} /> : !selectedProject ? <section className="empty"><h2>选择项目</h2></section> : <>
           <Overview shots={visibleShots} tasks={visibleTasks} />
-          {tab === 'shots' && <Shots items={visibleShots} assets={visibleAssets} videos={visibleVideos} tasks={visibleTasks} config={config} busy={busy} run={run} reload={reload} />}
-          {tab === 'assets' && <Assets projectID={projectID} items={visibleAssets} shots={visibleShots} videos={visibleVideos} tasks={visibleTasks} config={config} busy={busy} run={run} reload={reload} />}
-          {tab === 'videos' && <Videos projectID={projectID} items={visibleVideos} busy={busy} run={run} reload={reload} />}
+          {tab === 'shots' && <Shots items={visibleShots} assets={visibleAssets} videos={videos} tasks={visibleTasks} config={config} busy={busy} run={run} reload={reload} />}
+          {tab === 'assets' && <Assets projectID={projectID} items={visibleAssets} shots={visibleShots} videos={videos} tasks={visibleTasks} config={config} busy={busy} run={run} reload={reload} />}
+          {tab === 'videos' && <Videos projectID={projectID} items={videos} busy={busy} run={run} reload={reload} />}
           {tab === 'tasks' && <Tasks items={actionableTasks} busy={busy} run={run} reload={reload} />}
         </>}
       </main>
@@ -254,6 +259,7 @@ function Shots({ items, assets, videos, tasks, config, busy, run, reload }) {
 
   const shotVideo = videos.find((video) => video.id === selected?.video_id || video.shot_id === selected?.id)
   const shotVideoTask = tasks.find((task) => task.id === selected?.task_id) || tasks.find((task) => task.shot_id === selected?.id && task.kind === 'video_generation')
+  const historicalVideo = shotVideo && shotVideoTask?.prompt !== selected?.prompt
   const hasActiveImageTask = tasks.some((task) => task.shot_id === selected?.id && task.kind === 'image_generation' && ['queued', 'running'].includes(task.status))
   const linkedAssets = selected?.asset_links?.map((link) => ({ link, asset: assets.find((asset) => asset.id === link.asset_id) })).filter((item) => item.asset) || []
   const generatedImages = linkedAssets.filter(({ link, asset }) => link.note?.startsWith('GPT Image 2 ') && asset.content_type.startsWith('image/'))
@@ -304,7 +310,7 @@ function Shots({ items, assets, videos, tasks, config, busy, run, reload }) {
       {(selected.generation_route === 'post_production' || selected.requires_editorial_split) && <div className="gate-warning">{selected.generation_route === 'post_production' ? '此镜头走后期制作路线，不直接调用视频 API。' : '此镜头需先拆成单一动作镜头，再进入生成。'}</div>}
       <section className="shot-section"><div className="section-head compact-head"><div><p className="eyebrow">关联素材</p><h3>{linkedAssets.length} 项</h3></div><button className="ghost compact" onClick={() => setLinking(true)}>+ 关联素材</button></div><div className="linked-assets">{linkedAssets.map(({ link, asset }) => <span className="link-chip" key={link.id}>{kindLabels[asset.kind]} · {asset.name}{link.note && ` · ${link.note}`}<button aria-label="移除关联" onClick={() => unlink(link.id)}>×</button></span>)}{!linkedAssets.length && <span className="muted">尚未关联角色、场景或参考文件。</span>}</div></section>
       {shotImages.length > 0 && <section className="shot-section"><p className="eyebrow">GPT Image 2 镜头图片</p><div className="shot-images">{shotImages.map((image, index) => <button type="button" key={image.id} onClick={() => setImageViewer({ title: selected.id, images: shotImages, index })}><img src={image.src} alt={image.alt} /><span>{image.label}</span></button>)}</div></section>}
-      {(shotVideo || shotVideoTask) && <section className="shot-section result-grid">{shotVideo && <div><p className="eyebrow">已有试片</p><video controls preload="metadata" src={`/api/videos/${shotVideo.id}/content`} /></div>}{shotVideoTask && <div><p className="eyebrow">视频任务</p><div className="task-summary"><span className={`status status-${shotVideoTask.status}`}>{taskLabels[shotVideoTask.status]}</span><p>{shotVideoTask.provider} · {shotVideoTask.progress}%</p><small>{formatTime(shotVideoTask.updated_at)}</small></div></div>}</section>}
+      {(shotVideo || shotVideoTask) && <section className="shot-section result-grid">{shotVideo && <div><p className="eyebrow">{historicalVideo ? '历史试片（非当前版本）' : '已有试片'}</p><video controls preload="metadata" src={`/api/videos/${shotVideo.id}/content`} /></div>}{shotVideoTask && <div><p className="eyebrow">视频任务</p><div className="task-summary"><span className={`status status-${shotVideoTask.status}`}>{taskLabels[shotVideoTask.status]}</span><p>{shotVideoTask.provider} · {shotVideoTask.progress}%</p><small>{formatTime(shotVideoTask.updated_at)}</small></div></div>}</section>}
       <section className="review-box"><label className="field"><span>审核意见</span><textarea value={note} onChange={(event) => setNote(event.target.value)} maxLength="2000" placeholder="角色、动作、构图、提示词需要怎样调整…" /></label><div className="review-actions"><button className="ghost" disabled={busy} onClick={() => review('pending')}>恢复待审</button><button className="ghost changes" disabled={busy} onClick={() => review('changes_requested')}>要求修改</button><button className="ghost danger" disabled={busy} onClick={() => review('rejected')}>驳回</button><button className="primary approve" disabled={busy} onClick={() => review('approved')}>通过镜头</button></div></section>
       <section className="generation-bar"><div><strong>分镜图</strong><small>独立创建首帧图、末帧图、预览图；不生成视频。</small></div><button className="ghost" disabled={busy || !config?.openai_image_configured || hasActiveImageTask} onClick={generateImages}>{hasActiveImageTask ? '分镜图生成中' : '生成/补全分镜图'}</button></section>
       <section className="generation-bar"><div><strong>{canGenerate ? '镜头已过视频生成门禁' : '先通过审核与路线门禁'}</strong><small>视频生成与分镜图独立。MiniMax 需单独确认。</small></div><div className="generation-options"><label><input type="checkbox" checked={useFrameImages} disabled={referenceImageIDs.length > 0} onChange={(event) => setUseFrameImages(event.target.checked)} /> 首尾帧作为视频输入</label><label>角色模型写入提示词<select value={characterPromptCount} onChange={(event) => setCharacterPromptCount(Number(event.target.value))}><option value={0}>不写入</option><option value={1}>1 个</option><option value={2}>2 个</option><option value={3}>3 个</option></select></label><label>参考图资源（最多 9 张，和首尾帧互斥）<select multiple value={referenceImageIDs} disabled={useFrameImages} onChange={(event) => setReferenceImageIDs([...event.target.selectedOptions].map((option) => option.value).slice(0, 9))}>{referenceImages.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}</select></label></div><div className="row"><button className="ghost" disabled={busy || !canGenerate || ['queued', 'running'].includes(shotVideoTask?.status)} onClick={() => generate('mock')}>Mock 视频预演</button><button className="primary" disabled={busy || !canGenerate || !config?.paid_generation_allowed || !config?.minimax_configured || ['queued', 'running'].includes(shotVideoTask?.status)} onClick={() => generate('minimax')}>生成视频</button></div></section>
@@ -391,6 +397,8 @@ function Assets({ projectID, items, shots, videos, tasks, config, busy, run, rel
 }
 
 function Videos({ projectID, items, busy, run, reload }) {
+	const [status, setStatus] = useState('')
+	const filtered = items.filter((item) => !status || (item.review_status || 'unreviewed') === status)
   async function upload(event) {
     event.preventDefault()
     const formElement = event.currentTarget
@@ -402,7 +410,10 @@ function Videos({ projectID, items, busy, run, reload }) {
     if (!window.confirm(`删除试片“${item.title}”及文件？此操作不可恢复。`)) return
     await run(async () => { await api(`/api/videos/${item.id}`, { method: 'DELETE' }); await reload() }).catch(() => {})
   }
-  return <section className="workspace"><form className="panel upload-bar video-upload" onSubmit={upload}><label className="field"><span>试片名</span><input name="name" required maxLength="200" placeholder="E001-S001-SH001 初稿" /></label><label className="field file-field"><span>视频文件</span><input name="file" type="file" accept="video/*" required /></label><button className="primary" disabled={busy}>上传试片</button></form><div className="video-grid">{items.map((item) => <article className="video-card" key={item.id}><video controls preload="metadata" src={`/api/videos/${item.id}/content`} /><div className="media-body"><div className="row"><span className="tag">{item.provider || 'upload'}</span>{item.shot_id && <span className="tag muted-tag">{item.shot_id}</span>}</div><h3>{item.title}</h3><p>{item.filename}</p><small>{formatBytes(item.size)} · {formatTime(item.created_at)}</small></div><div className="media-actions"><a className="ghost" href={`/api/videos/${item.id}/content`} download={item.filename}>下载</a><button className="danger ghost" onClick={() => remove(item)}>删除</button></div></article>)}{!items.length && <section className="empty"><h2>没有试片</h2><p>审核镜头后创建预演或生成任务。</p></section>}</div></section>
+  async function review(item, nextStatus) {
+    await run(async () => { await api(`/api/videos/${item.id}/review`, json('PATCH', { status: nextStatus })); await reload() }).catch(() => {})
+  }
+  return <section className="workspace"><form className="panel upload-bar video-upload" onSubmit={upload}><label className="field"><span>试片名</span><input name="name" required maxLength="200" placeholder="E001-S001-SH001 初稿" /></label><label className="field file-field"><span>视频文件</span><input name="file" type="file" accept="video/*" required /></label><button className="primary" disabled={busy}>上传试片</button></form><div className="panel asset-toolbar"><label className="field"><span>试片审核</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">全部状态</option>{Object.entries(videoReviewLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><p className="muted">试片属于当前项目，不随分镜版本隐藏；生成版本只作溯源。</p></div><div className="video-grid">{filtered.map((item) => { const reviewStatus = item.review_status || 'unreviewed'; return <article className="video-card" key={item.id}><video controls preload="metadata" src={`/api/videos/${item.id}/content`} /><div className="media-body"><div className="row wrap"><span className={`review review-${reviewStatus === 'usable' ? 'approved' : reviewStatus === 'rejected' ? 'rejected' : 'pending'}`}>{videoReviewLabels[reviewStatus]}</span><span className="tag">{item.provider || 'upload'}</span>{item.shot_id && <span className="tag muted-tag">{item.shot_id}</span>}</div><h3>{item.filename}</h3><p>{item.task_id ? `任务 ${item.task_id}` : item.title}</p><small>{item.input_version ? `生成版本：${item.input_version} · ` : '历史试片 · '}{formatBytes(item.size)} · {formatTime(item.created_at)}</small></div><div className="media-actions"><button className="ghost" disabled={busy} onClick={() => review(item, 'usable')}>标为可用</button><button className="ghost" disabled={busy} onClick={() => review(item, 'rejected')}>不采用</button><button className="ghost" disabled={busy} onClick={() => review(item, 'unreviewed')}>恢复未审</button><a className="ghost" href={`/api/videos/${item.id}/content`} download={item.filename}>下载</a><button className="danger ghost" onClick={() => remove(item)}>删除</button></div></article> })}{!filtered.length && <section className="empty"><h2>没有匹配试片</h2><p>试片不受分镜版本筛选。</p></section>}</div></section>
 }
 
 function Tasks({ items, busy, run, reload }) {
